@@ -1,0 +1,842 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+WORK_DIR="${OMARCHY_TEST_WORK_DIR:-$ROOT/release/vm-test}"
+CURRENT_LINK="$WORK_DIR/current"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  omarchy-iso-vm-test [run] [--iso PATH] [--no-build] [--reuse-disk] [--no-interactive-on-failure]
+  omarchy-iso-vm-test key KEY
+  omarchy-iso-vm-test screenshot [PATH]
+  omarchy-iso-vm-test screen
+
+The run command builds the ISO from ~/src/omarchy by default,
+then boots that ISO in a KVM VM with VNC visibility and drives the real installer UI.
+
+Environment:
+  OMARCHY_TEST_OMARCHY_PATH          Local Omarchy checkout (default: ~/src/omarchy)
+  OMARCHY_TEST_USER                  Installer username (default: omarchy)
+  OMARCHY_TEST_PASSWORD              Installer/root/encryption password (default: omarchy)
+  OMARCHY_TEST_HOSTNAME              Installed hostname (default: omarchy-test)
+  OMARCHY_TEST_VNC_DISPLAY           VNC display number (default: 5, port 5905)
+  OMARCHY_TEST_INTERACTIVE_ON_FAILURE Keep VM open on failure (default: 1)
+  OMARCHY_TEST_TIMEOUT               Install timeout in seconds (default: 7200)
+
+While a VM is running, connect with: vncviewer 127.0.0.1:5905
+USAGE
+}
+
+hmp_send() {
+  local socket="$1"
+  shift
+  local command="$*"
+
+  HMP_SOCKET="$socket" HMP_COMMAND="$command" python3 <<'PY'
+import os
+import socket
+import sys
+import time
+
+path = os.environ["HMP_SOCKET"]
+command = os.environ["HMP_COMMAND"]
+deadline = time.monotonic() + 10
+last_error = None
+
+while True:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        break
+    except OSError as exc:
+        last_error = exc
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"could not connect to HMP monitor {path}: {last_error}")
+        time.sleep(0.1)
+
+sock.settimeout(0.2)
+try:
+    while True:
+        data = sock.recv(4096)
+        if not data or b"(qemu)" in data:
+            break
+except OSError:
+    pass
+
+sock.sendall((command + "\n").encode())
+
+output = []
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    try:
+        data = sock.recv(4096)
+    except OSError:
+        break
+
+    if not data:
+        break
+
+    output.append(data)
+    if b"(qemu)" in data:
+        break
+
+sys.stdout.write(b"".join(output).decode("utf-8", "replace"))
+PY
+}
+
+current_state_dir() {
+  if [[ ! -L "$CURRENT_LINK" && ! -d "$CURRENT_LINK" ]]; then
+    echo "No active VM state found at $CURRENT_LINK" >&2
+    exit 1
+  fi
+
+  readlink -f "$CURRENT_LINK"
+}
+
+control_key() {
+  local state_dir
+  state_dir="$(current_state_dir)"
+
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: omarchy-iso-vm-test key KEY" >&2
+    exit 1
+  fi
+
+  hmp_send "$state_dir/monitor.sock" "sendkey $*" >/dev/null
+}
+
+control_screenshot() {
+  local state_dir path
+  state_dir="$(current_state_dir)"
+  path="${1:-$state_dir/screenshot-$(date +%Y%m%d-%H%M%S).ppm}"
+
+  hmp_send "$state_dir/monitor.sock" "screendump $path" >/dev/null
+  echo "$path"
+}
+
+control_screen() {
+  local state_dir screen_file
+  state_dir="$(current_state_dir)"
+  screen_file="$state_dir/screen.txt"
+
+  if [[ ! -f "$screen_file" ]]; then
+    echo "No captured tty1 screen yet: $screen_file" >&2
+    exit 1
+  fi
+
+  cat "$screen_file"
+}
+
+latest_iso() {
+  local latest
+
+  if read -r latest < <(ls -t "$ROOT"/release/*.iso 2>/dev/null); then
+    [[ -n "$latest" ]] || return 1
+    printf '%s\n' "$latest"
+  else
+    return 1
+  fi
+}
+
+require_command() {
+  local command="$1"
+
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
+    return 1
+  fi
+}
+
+ensure_run_dependencies() {
+  local build="$1"
+  local missing=0
+
+  require_command qemu-system-x86_64 || missing=1
+  require_command qemu-img || missing=1
+  require_command expect || missing=1
+  require_command python3 || missing=1
+  if [[ "$build" == "1" ]]; then
+    require_command docker || missing=1
+  fi
+
+  if [[ "$missing" == "1" ]]; then
+    exit 1
+  fi
+}
+
+find_first_file() {
+  local path
+
+  for path in "$@"; do
+    if [[ -f "$path" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_qemu_data_file() {
+  local data_dir name path
+
+  while IFS= read -r data_dir; do
+    for name in "$@"; do
+      path="${data_dir%/}/$name"
+      if [[ -f "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    done
+  done < <(qemu-system-x86_64 -L help 2>/dev/null || true)
+
+  return 1
+}
+
+find_ovmf_code() {
+  if [[ -n "${OMARCHY_OVMF_CODE:-}" ]]; then
+    find_first_file "$OMARCHY_OVMF_CODE"
+    return
+  fi
+
+  find_first_file \
+    /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+    /usr/share/edk2/x64/OVMF_CODE.fd \
+    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+    /usr/share/qemu/edk2-x86_64-code.fd || \
+    find_qemu_data_file \
+      edk2-x86_64-code.fd \
+      OVMF_CODE.4m.fd \
+      OVMF_CODE.fd
+}
+
+find_ovmf_vars() {
+  if [[ -n "${OMARCHY_OVMF_VARS:-}" ]]; then
+    find_first_file "$OMARCHY_OVMF_VARS"
+    return
+  fi
+
+  find_first_file \
+    /usr/share/edk2/x64/OVMF_VARS.4m.fd \
+    /usr/share/edk2/x64/OVMF_VARS.fd \
+    /usr/share/edk2-ovmf/x64/OVMF_VARS.fd \
+    /usr/share/qemu/edk2-i386-vars.fd || \
+    find_qemu_data_file \
+      OVMF_VARS.4m.fd \
+      OVMF_VARS.fd \
+      edk2-i386-vars.fd
+}
+
+run_test() {
+  local build=1
+  local iso=""
+  local reuse_disk=0
+  local interactive_on_failure="${OMARCHY_TEST_INTERACTIVE_ON_FAILURE:-1}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --iso)
+        iso="$2"
+        build=0
+        shift 2
+        ;;
+      --no-build)
+        build=0
+        shift
+        ;;
+      --reuse-disk)
+        reuse_disk=1
+        shift
+        ;;
+      --no-interactive-on-failure)
+        interactive_on_failure=0
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  ensure_run_dependencies "$build"
+
+  local omarchy_path="${OMARCHY_TEST_OMARCHY_PATH:-$HOME/src/omarchy}"
+
+  if [[ "$build" == "1" ]]; then
+    if [[ ! -d "$omarchy_path" ]]; then
+      echo "Local Omarchy source not found: $omarchy_path" >&2
+      echo "Set OMARCHY_PATH or check out Omarchy at ~/src/omarchy." >&2
+      exit 1
+    fi
+
+    echo "Building ISO from local Omarchy source: $omarchy_path"
+    OMARCHY_ISO_SKIP_PACMAN_CACHE_CLEAR=1 OMARCHY_PATH="$omarchy_path" "$SCRIPT_DIR/omarchy-iso-make" --local-source --no-boot-offer
+    iso="$(latest_iso)"
+  elif [[ -z "$iso" ]]; then
+    iso="$(latest_iso)"
+  fi
+
+  if [[ ! -f "$iso" ]]; then
+    echo "ISO not found: $iso" >&2
+    exit 1
+  fi
+
+  if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    echo "KVM is required for this VM test, but /dev/kvm is not readable/writable." >&2
+    exit 1
+  fi
+
+  local timestamp state_dir disk ovmf_code ovmf_vars_template ovmf_vars
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  state_dir="$WORK_DIR/$timestamp"
+  mkdir -p "$state_dir"
+  ln -sfnT "$state_dir" "$CURRENT_LINK"
+
+  if [[ "$reuse_disk" == "1" ]]; then
+    disk="$WORK_DIR/reusable.qcow2"
+  else
+    disk="$state_dir/omarchy-test.qcow2"
+  fi
+
+  if [[ ! -f "$disk" ]]; then
+    qemu-img create -f qcow2 "$disk" "${OMARCHY_TEST_DISK_SIZE:-80G}" >/dev/null
+  fi
+
+  ovmf_code="$(find_ovmf_code)" || {
+    echo "Could not find OVMF_CODE firmware. Set OMARCHY_OVMF_CODE." >&2
+    exit 1
+  }
+
+  ovmf_vars_template="$(find_ovmf_vars)" || {
+    echo "Could not find OVMF_VARS firmware. Set OMARCHY_OVMF_VARS." >&2
+    exit 1
+  }
+
+  ovmf_vars="$state_dir/OVMF_VARS.fd"
+  cp "$ovmf_vars_template" "$ovmf_vars"
+  chmod u+w "$ovmf_vars"
+
+  local hmp_socket vnc_display vnc_port ssh_port width height smp memory timeout_seconds
+  hmp_socket="$state_dir/monitor.sock"
+  vnc_display="${OMARCHY_TEST_VNC_DISPLAY:-5}"
+  vnc_port=$((5900 + vnc_display))
+  ssh_port="${OMARCHY_TEST_SSH_PORT:-2222}"
+  width="${OMARCHY_TEST_WIDTH:-1024}"
+  height="${OMARCHY_TEST_HEIGHT:-768}"
+  smp="${OMARCHY_TEST_SMP:-4}"
+  memory="${OMARCHY_TEST_MEMORY:-8192}"
+  timeout_seconds="${OMARCHY_TEST_TIMEOUT:-7200}"
+
+  local qemu_args=(
+    qemu-system-x86_64
+    -enable-kvm
+    -machine q35,accel=kvm
+    -cpu host
+    -smp "$smp"
+    -m "$memory"
+    -display none
+    -vnc "127.0.0.1:$vnc_display"
+    -device virtio-vga,xres="$width",yres="$height"
+    -monitor "unix:$hmp_socket,server=on,wait=off"
+    -serial stdio
+    -no-reboot
+    -drive if=pflash,format=raw,readonly=on,file="$ovmf_code"
+    -drive if=pflash,format=raw,file="$ovmf_vars"
+    -drive if=none,id=vdisk,file="$disk",format=qcow2,cache=writeback,discard=unmap
+    -device virtio-blk-pci,drive=vdisk,serial=omarchy-iso-vm-test,bootindex=2
+    -drive if=none,id=omarchyiso,file="$iso",format=raw,media=cdrom,readonly=on
+    -device ide-cd,drive=omarchyiso,bus=ide.0,bootindex=1
+    -boot menu=off,strict=on
+    -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"$ssh_port"-:22
+  )
+
+  cat >"$state_dir/run.env" <<EOF
+ISO=$iso
+DISK=$disk
+VNC=127.0.0.1:$vnc_port
+HMP_SOCKET=$hmp_socket
+SERIAL_LOG=$state_dir/serial.log
+SCREEN=$state_dir/screen.txt
+EOF
+
+  echo "Booting ISO VM test with KVM"
+  echo "ISO: $iso"
+  echo "Disk: $disk"
+  echo "VNC: 127.0.0.1:$vnc_port"
+  echo "Artifacts: $state_dir"
+
+  expect -f - \
+    "$hmp_socket" \
+    "$state_dir" \
+    "${OMARCHY_TEST_USER:-omarchy}" \
+    "${OMARCHY_TEST_PASSWORD:-omarchy}" \
+    "${OMARCHY_TEST_HOSTNAME:-omarchy-test}" \
+    "$timeout_seconds" \
+    "$vnc_display" \
+    "$interactive_on_failure" \
+    "${OMARCHY_TEST_LOG_SERIAL_TO_STDOUT:-0}" \
+    "${qemu_args[@]}" <<'EXPECT'
+set hmp_socket [lindex $argv 0]
+set state_dir [lindex $argv 1]
+set test_user [lindex $argv 2]
+set test_password [lindex $argv 3]
+set test_hostname [lindex $argv 4]
+set install_timeout [lindex $argv 5]
+set vnc_display [lindex $argv 6]
+set interactive_on_failure [lindex $argv 7]
+set log_serial_stdout [lindex $argv 8]
+set qemu_argv [lrange $argv 9 end]
+
+set install_ok 0
+set install_seen 0
+set screen_id 0
+
+log_file -a "$state_dir/serial.log"
+log_user $log_serial_stdout
+match_max -d 65536
+
+proc hmp {command} {
+  global hmp_socket
+
+  set script {
+import os
+import socket
+import sys
+import time
+
+path = os.environ["HMP_SOCKET"]
+command = os.environ["HMP_COMMAND"]
+deadline = time.monotonic() + 10
+last_error = None
+
+while True:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        break
+    except OSError as exc:
+        last_error = exc
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"could not connect to HMP monitor {path}: {last_error}")
+        time.sleep(0.1)
+
+sock.settimeout(0.2)
+try:
+    while True:
+        data = sock.recv(4096)
+        if not data or b"(qemu)" in data:
+            break
+except OSError:
+    pass
+
+sock.sendall((command + "\n").encode())
+
+output = []
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    try:
+        data = sock.recv(4096)
+    except OSError:
+        break
+
+    if not data:
+        break
+
+    output.append(data)
+    if b"(qemu)" in data:
+        break
+
+sys.stdout.write(b"".join(output).decode("utf-8", "replace"))
+  }
+
+  if {[catch {exec env HMP_SOCKET=$hmp_socket HMP_COMMAND=$command python3 -c $script} output]} {
+    puts stderr "HMP command failed: $command"
+    puts stderr $output
+    error $output
+  }
+
+  return $output
+}
+
+proc screenshot {name} {
+  global state_dir
+
+  set safe $name
+  regsub -all {[^A-Za-z0-9_.-]} $safe "_" safe
+  set path "$state_dir/$safe.ppm"
+
+  if {[catch {hmp "screendump $path"}]} {
+    return ""
+  }
+
+  return $path
+}
+
+proc fail {message} {
+  global interactive_on_failure state_dir vnc_display
+
+  catch {screenshot failure}
+  puts stderr "\nVM test failed: $message"
+  puts stderr "VNC: 127.0.0.1:[expr {5900 + $vnc_display}]"
+  puts stderr "Artifacts: $state_dir"
+
+  if {$interactive_on_failure eq "1"} {
+    puts stderr "Keeping the VM open for debugging. Use VNC for display/input; this terminal is the serial console."
+    puts stderr "Quit QEMU or close this terminal to finish the failed test."
+    interact
+  }
+
+  exit 1
+}
+
+proc send_key {key} {
+  hmp "sendkey $key"
+  after 120
+}
+
+proc key_name {char} {
+  switch -- $char {
+    " " { return "spc" }
+    "-" { return "minus" }
+    "." { return "dot" }
+    "/" { return "slash" }
+    "_" { return "shift-minus" }
+    default {
+      if {[regexp {^[a-z0-9]$} $char]} {
+        return $char
+      }
+
+      error "No QEMU key mapping for character: $char"
+    }
+  }
+}
+
+proc type_text {text} {
+  foreach char [split $text ""] {
+    send_key [key_name $char]
+  }
+}
+
+proc mark_install_ok {} {
+  global install_ok
+
+  if {!$install_ok} {
+    puts "Detected Omarchy install completion marker"
+  }
+
+  set install_ok 1
+}
+
+proc save_screen {screen} {
+  global state_dir
+
+  set f [open "$state_dir/screen.txt" w]
+  puts -nonewline $f $screen
+  close $f
+
+  set history [open "$state_dir/screen-history.log" a]
+  puts $history "\n===== [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] ====="
+  puts $history $screen
+  close $history
+}
+
+proc fold_screen {screen cols} {
+  if {![string is integer -strict $cols] || $cols < 1} {
+    set cols 80
+  }
+
+  set out ""
+  set len [string length $screen]
+
+  for {set i 0} {$i < $len} {incr i $cols} {
+    append out [string range $screen $i [expr {$i + $cols - 1}]] "\n"
+  }
+
+  return $out
+}
+
+proc read_screen {} {
+  global screen_id install_ok state_dir timeout
+
+  incr screen_id
+  set done "__OMARCHY_VCS_DONE_${screen_id}__"
+  send -- "cols=\$(stty size < /dev/tty1 2>/dev/null || printf '24 80'); cols=\${cols##* }; printf '\\n__OMARCHY_VCS_BEGIN_%s__\\n%s\\n' $screen_id \"\${cols:-80}\"; LC_ALL=C tr '\\000' ' ' </dev/vcs1 | base64 -w0; printf '\\n__OMARCHY_VCS_END_%s__\\n' $screen_id; printf '\\n__OMARCHY_VCS_DONE_%s__\\n' $screen_id\r"
+  set output [wait_serial_marker $done "screen capture $screen_id" 1]
+
+  if {$output eq "__EOF__"} {
+    return "__EOF__"
+  }
+
+  set cols 80
+  set encoded ""
+  set pattern [format {__OMARCHY_VCS_BEGIN_%s__[[:space:]]+([0-9]+)[[:space:]]+([A-Za-z0-9+/=]+)[[:space:]]+__OMARCHY_VCS_END_%s__} $screen_id $screen_id]
+
+  if {![regexp $pattern $output -> cols encoded]} {
+    puts stderr "screen capture marker $screen_id was not found in serial command output"
+    return ""
+  }
+
+  if {$encoded eq ""} {
+    return ""
+  }
+
+  if {[catch {binary decode base64 $encoded} screen]} {
+    set screen $encoded
+  }
+
+  set screen [fold_screen $screen $cols]
+  save_screen $screen
+  return $screen
+}
+
+proc check_fail_screen {screen} {
+  if {[regexp -nocase {(Omarchy installation stopped|Traceback|==> ERROR|error: failed|failed to prepare transaction|target not found|No space left on device)} $screen]} {
+    fail "installer displayed a fail-fast pattern"
+  }
+}
+
+proc wait_screen {description pattern seconds} {
+  global install_ok
+
+  puts "Waiting for $description"
+  set deadline [expr {[clock seconds] + $seconds}]
+
+  while {[clock seconds] < $deadline} {
+    set screen [read_screen]
+
+    if {$screen eq "__EOF__"} {
+      if {$install_ok} {
+        return "eof"
+      }
+
+      fail "VM exited while waiting for $description"
+    }
+
+    check_fail_screen $screen
+
+    if {[regexp -nocase $pattern $screen]} {
+      set shot [screenshot $description]
+      if {$shot ne ""} {
+        puts "Captured $description screenshot: $shot"
+      }
+      return "matched"
+    }
+
+    after 1000
+  }
+
+  fail "timed out waiting for $description"
+}
+
+proc wait_shell_prompt {} {
+  expect {
+    -re {__OMARCHY_INSTALL_COMPLETED__} {
+      mark_install_ok
+      exp_continue
+    }
+    -re {__OMARCHY_PROMPT__# } {
+      return $expect_out(buffer)
+    }
+    eof {
+      fail "VM exited before serial root shell was ready"
+    }
+    timeout {
+      fail "timed out waiting for serial root shell"
+    }
+  }
+}
+
+proc wait_serial_marker {marker description {allow_eof 0}} {
+  expect {
+    -re {__OMARCHY_INSTALL_COMPLETED__} {
+      mark_install_ok
+      exp_continue
+    }
+    -re $marker {
+      return $expect_out(buffer)
+    }
+    eof {
+      if {$allow_eof} {
+        return "__EOF__"
+      }
+      fail "VM exited while waiting for $description"
+    }
+    timeout {
+      fail "timed out waiting for $description"
+    }
+  }
+}
+
+proc start_completion_watcher {} {
+  send -- "OMARCHY_TEST_TTY=\$(tty); (while true; do if test -f /mnt/var/tmp/omarchy-install-completed; then printf '\\n__OMARCHY_INSTALL_%s__\\n' COMPLETED >\"\$OMARCHY_TEST_TTY\"; break; fi; sleep 1; done) >/dev/null 2>&1 & printf '\\n__OMARCHY_WATCHER_STARTED__\\n'\r"
+  wait_serial_marker "__OMARCHY_WATCHER_STARTED__" "completion watcher startup"
+}
+
+proc wait_install {seconds} {
+  global install_ok install_seen
+
+  puts "Waiting for Omarchy installation to finish"
+  set deadline [expr {[clock seconds] + $seconds}]
+
+  while {[clock seconds] < $deadline} {
+    set screen [read_screen]
+
+    if {$screen eq "__EOF__"} {
+      if {$install_ok || $install_seen} {
+        puts "VM exited after install completion"
+        return
+      }
+
+      fail "VM exited before install completion marker"
+    }
+
+    check_fail_screen $screen
+
+    if {[regexp -nocase {(Finished installing|Installed in|Installation completed without any errors|Rebooting system)} $screen]} {
+      set install_seen 1
+    }
+
+    if {$install_ok} {
+      puts "Install completion marker reached; waiting for VM reboot exit"
+      expect {
+        eof {
+          puts "VM exited cleanly after requested reboot"
+          return
+        }
+        timeout {
+          return
+        }
+      }
+    }
+
+    after 5000
+  }
+
+  fail "timed out waiting for Omarchy installation"
+}
+
+spawn {*}$qemu_argv
+match_max 65536
+
+set timeout 600
+expect {
+  -re {archiso login:} {
+    send -- "root\r"
+    exp_continue
+  }
+  -re {# } {}
+  eof {
+    fail "VM exited before live ISO login"
+  }
+  timeout {
+    fail "timed out waiting for live ISO login"
+  }
+}
+
+send -- "exec /bin/bash --noprofile --norc\r"
+expect {
+  -re {bash-[^#]*# } {}
+  eof {
+    fail "VM exited before bash serial shell was ready"
+  }
+  timeout {
+    fail "timed out waiting for bash serial shell"
+  }
+}
+
+send -- "export PS1='__OMARCHY_PROMPT__# '\r"
+expect {
+  -re {__OMARCHY_PROMPT__# } {}
+  eof {
+    fail "VM exited before fixed serial prompt was ready"
+  }
+  timeout {
+    fail "timed out waiting for fixed serial prompt"
+  }
+}
+
+send -- "stty -echo; printf '\\n__OMARCHY_STTY_DONE__\\n'\r"
+wait_serial_marker "__OMARCHY_STTY_DONE__" "serial stty setup"
+start_completion_watcher
+
+wait_screen "keyboard layout prompt" {Select keyboard layout} 300
+send_key ret
+
+wait_screen "username prompt" {Username>} 120
+type_text $test_user
+send_key ret
+
+wait_screen "password prompt" {Password>} 120
+type_text $test_password
+send_key ret
+
+wait_screen "password confirmation prompt" {Confirm>} 120
+type_text $test_password
+send_key ret
+
+wait_screen "full name prompt" {Full name>} 120
+send_key ret
+
+wait_screen "email prompt" {Email address>} 120
+send_key ret
+
+wait_screen "hostname prompt" {Hostname>} 120
+type_text $test_hostname
+send_key ret
+
+wait_screen "timezone prompt" {Timezone} 180
+send_key ret
+
+wait_screen "summary confirmation" {Does this look right} 120
+send_key y
+
+wait_screen "disk selector" {Select install disk} 120
+send_key ret
+
+wait_screen "disk overwrite confirmation" {Confirm overwriting} 120
+send_key y
+
+wait_install $install_timeout
+EXPECT
+}
+
+command="${1:-run}"
+case "$command" in
+  run)
+    shift || true
+    run_test "$@"
+    ;;
+  --*)
+    run_test "$@"
+    ;;
+  key)
+    shift
+    control_key "$@"
+    ;;
+  screenshot)
+    shift
+    control_screenshot "$@"
+    ;;
+  screen)
+    shift
+    control_screen
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $command" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
