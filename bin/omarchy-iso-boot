@@ -2,8 +2,8 @@
 
 set -e
 
-ISO="$1"
-REUSE="$2"
+ISO="${1:-}"
+REUSE="${2:-}"
 
 if [ $# -eq 0 ]; then
   ISO=$(ls -t release/*.iso 2>/dev/null | gum choose --header "Select ISO to boot")
@@ -21,12 +21,14 @@ fi
 omarchy-pkg-add qemu-full edk2-ovmf
 
 DISK="/tmp/omarchy-iso-boot.qcow2"
+BOOT_OPTION="menu=on"
 if [[ ! -f $DISK || $REUSE != "reuse" ]]; then
   qemu-img create -f qcow2 "$DISK" 40G
   cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /tmp/OVMF_VARS.4m.fd
+  BOOT_OPTION="once=d,menu=on"
 fi
 
-# Boot from ISO before we've installed, then boot from drive after
+# Boot the ISO once for installation, then prefer the installed disk after reboot.
 qemu-system-x86_64 \
   -cpu host -enable-kvm -machine q35,accel=kvm \
   -smp "$(nproc)" \
@@ -37,9 +39,9 @@ qemu-system-x86_64 \
   -device virtio-blk-pci,drive=drive0,bootindex=1 \
   -drive file="$ISO",media=cdrom,if=none,format=raw,id=cdrom0 \
   -device ide-cd,drive=cdrom0,bootindex=2 \
-  -device virtio-vga-gl \
-  -display gtk,gl=on \
+  -device virtio-vga,xres=1280,yres=800 \
+  -display gtk,gl=off,zoom-to-fit=on \
   -usb -device usb-tablet \
   -netdev user,id=net0,hostfwd=tcp::2222-:22 \
   -device virtio-net-pci,netdev=net0 \
-  -boot menu=on
+  -boot "$BOOT_OPTION"

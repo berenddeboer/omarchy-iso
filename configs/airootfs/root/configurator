@@ -266,14 +266,30 @@ disk_form() {
 
 disk_form
 
+filesystem_form() {
+  step "Let's choose the root filesystem..."
+
+  local choice
+  choice=$(printf 'Btrfs (encrypted, snapshots)\nZFS (unencrypted, experimental)' | gum choose --selected "Btrfs (encrypted, snapshots)" --header "Select root filesystem") || abort
+
+  case "$choice" in
+    "Btrfs"*) root_filesystem="btrfs" ;;
+    "ZFS"*) root_filesystem="zfs" ;;
+    *) abort ;;
+  esac
+}
+
+filesystem_form
+
 while true; do
   gum style "Everything will be overwritten. There is no recovery possible."
 
   echo
-  if gum confirm --affirmative "Yes, format disk" --negative "No, change it" "Confirm overwriting ${disk}"; then
+  if gum confirm --affirmative "Yes, format disk" --negative "No, change it" "Confirm overwriting ${disk} with ${root_filesystem}"; then
     break
   else
     disk_form
+    filesystem_form
   fi
 done
 
@@ -283,6 +299,11 @@ clear
 # set them as OMARCHY_USER_NAME and OMARCHY_USER_EMAIL
 echo "$full_name" >user_full_name.txt
 echo "$email_address" >user_email_address.txt
+echo "$root_filesystem" >root_filesystem.txt
+echo "$disk" >disk.txt
+echo "$hostname" >hostname.txt
+echo "$timezone" >timezone.txt
+echo "$keyboard" >keyboard.txt
 
 # Escape username and password for safe inclusion
 password_escaped=$(echo -n "$password" | jq -Rsa)
@@ -324,7 +345,8 @@ else
   kernel_choice="linux"
 fi
 
-cat <<-_EOF_ >user_configuration.json
+if [[ $root_filesystem == "btrfs" ]]; then
+  cat <<-_EOF_ >user_configuration.json
 {
     "app_config": null,
     "archinstall-language": "English",
@@ -439,6 +461,24 @@ cat <<-_EOF_ >user_configuration.json
     "version": "3.0.9"
 }
 _EOF_
+else
+  cat <<-_EOF_ >user_configuration.json
+{
+    "archinstall-language": "English",
+    "disk_config": {
+        "config_type": "pre_mounted_config",
+        "mountpoint": "/mnt"
+    },
+    "hostname": "$hostname",
+    "kernels": [ "$kernel_choice" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "packages": [],
+    "timezone": "$timezone",
+    "version": "3.0.9"
+}
+_EOF_
+fi
 
 if [[ $1 == "dry" ]]; then
   echo -e "User Configuration:"
@@ -453,5 +493,5 @@ if [[ $1 == "dry" ]]; then
   echo -e "\nUser Email Address:"
   cat user_email_address.txt
 
-  rm user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt
+  rm user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt root_filesystem.txt disk.txt hostname.txt timezone.txt keyboard.txt
 fi

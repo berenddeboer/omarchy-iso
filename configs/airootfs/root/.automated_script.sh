@@ -26,19 +26,113 @@ install_arch() {
 
   # Set CURRENT_SCRIPT for the trap to display better when nothing is returned for some reason
   CURRENT_SCRIPT="install_base_system"
-  install_base_system > >(sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g' >>/var/log/omarchy-install.log) 2>&1
+  if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    install_zfs_base_system > >(sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g' >>/var/log/omarchy-install.log) 2>&1
+  else
+    install_base_system > >(sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g' >>/var/log/omarchy-install.log) 2>&1
+  fi
   unset CURRENT_SCRIPT
   stop_log_output
 }
 
 install_omarchy() {
+  ensure_zfs_target_mounts_if_needed "before installing gum"
+  assert_zfs_chroot_home_mount_if_needed "before installing gum"
   chroot_bash -lc "sudo pacman -S --noconfirm --needed gum" >/dev/null
+  ensure_zfs_target_mounts_if_needed "after installing gum"
+  assert_zfs_chroot_home_mount_if_needed "after installing gum"
+  assert_zfs_chroot_home_mount_if_needed "before Omarchy install"
   chroot_bash -lc "source /home/$OMARCHY_USER/.local/share/omarchy/install.sh || bash"
+  ensure_zfs_target_mounts_if_needed "after Omarchy install"
+  assert_zfs_chroot_home_mount_if_needed "after Omarchy install"
+
+  if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    append_archzfs_repo /mnt/etc/pacman.conf
+  fi
+
+  verify_omarchy_target_config
+  cleanup_zfs_home_probe_if_needed
 
   # Reboot if requested by installer
   if [[ -f /mnt/var/tmp/omarchy-install-completed ]]; then
     reboot
   fi
+}
+
+ensure_zfs_target_mounts_if_needed() {
+  if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    ensure_zfs_target_mounts zroot "${1:-unspecified}"
+  fi
+}
+
+verify_omarchy_target_config() {
+  local user_home="/mnt/home/$OMARCHY_USER"
+
+  if ! omarchy_home_has_target_config "$user_home"; then
+    echo "Expected Omarchy config in $user_home" >&2
+    exit 1
+  fi
+
+  if [[ $(<root_filesystem.txt) == "zfs" && ! -f /mnt/var/log/omarchy-install.log ]]; then
+    echo "Expected Omarchy install log in /mnt/var/log/omarchy-install.log" >&2
+    exit 1
+  fi
+}
+
+omarchy_home_has_target_config() {
+  local user_home="$1"
+  local hypr_config="$user_home/.config/hypr/hyprland.conf"
+
+  if [[ ! -f $user_home/.local/share/omarchy/install.sh ]]; then
+    return 1
+  fi
+  if [[ ! -f $hypr_config ]]; then
+    return 1
+  fi
+  if ! grep -q 'source = ~/.local/share/omarchy/default/hypr/autostart.conf' "$hypr_config"; then
+    return 1
+  fi
+}
+
+zfs_home_probe_name() {
+  printf '.omarchy-zfs-home-probe'
+}
+
+prepare_zfs_home_probe() {
+  local user_ids probe_path
+
+  user_ids=$(awk -F: -v user="$OMARCHY_USER" '$1 == user { print $3 ":" $4 }' /mnt/etc/passwd)
+  if [[ -z $user_ids ]]; then
+    echo "Expected target user $OMARCHY_USER in /mnt/etc/passwd" >&2
+    exit 1
+  fi
+
+  install -d -m 700 -o "${user_ids%:*}" -g "${user_ids#*:}" "/mnt/home/$OMARCHY_USER"
+  probe_path="/mnt/home/$OMARCHY_USER/$(zfs_home_probe_name)"
+  printf 'zroot/data/home\n' >"$probe_path"
+  chown "$user_ids" "$probe_path"
+}
+
+cleanup_zfs_home_probe_if_needed() {
+  if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    rm -f "/mnt/home/$OMARCHY_USER/$(zfs_home_probe_name)"
+  fi
+}
+
+assert_zfs_chroot_home_mount_if_needed() {
+  if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    assert_zfs_chroot_home_mount "${1:-unspecified}"
+  fi
+}
+
+assert_zfs_chroot_home_mount() {
+  local context="$1"
+  local probe_name
+
+  prepare_zfs_home_probe
+  probe_name=$(zfs_home_probe_name)
+
+  chroot_bash -lc "context='$context'; probe=\"\$HOME/$probe_name\"; root_source=\$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null || true); printf 'ZFS chroot home path check (%s): / source=%s, HOME=%s, probe=%s\\n' \"\$context\" \"\$root_source\" \"\$HOME\" \"\$probe\" >&2; if [[ ! -f \$probe ]] || [[ \$(<\"\$probe\") != zroot/data/home ]]; then echo \"Expected chroot HOME to resolve to zroot/data/home during \$context\" >&2; findmnt -R / >&2 || true; ls -la /home /home/$OMARCHY_USER >&2 || true; exit 1; fi"
 }
 
 # Set Tokyo Night color scheme for the terminal
@@ -103,8 +197,15 @@ install_base_system() {
     --skip-wkd \
     --skip-wifi-check
 
-  # After archinstall sets up the base system but before our installer runs,
-  # we need to ensure the offline pacman.conf is in place
+  prepare_target_for_omarchy
+}
+
+prepare_target_for_omarchy() {
+  ensure_zfs_target_mounts_if_needed "before preparing target for Omarchy"
+  assert_zfs_chroot_home_mount_if_needed "before preparing target for Omarchy"
+
+  # After the base system is installed but before our installer runs,
+  # we need to ensure the offline pacman.conf is in place.
   cp /etc/pacman.conf /mnt/etc/pacman.conf
 
   # Mount the offline mirror so it's accessible in the chroot
@@ -114,6 +215,8 @@ install_base_system() {
   # Mount the packages dir so it's accessible in the chroot
   mkdir -p /mnt/opt/packages
   mount --bind /opt/packages /mnt/opt/packages
+  ensure_zfs_target_mounts_if_needed "after bind mounting installer resources"
+  assert_zfs_chroot_home_mount_if_needed "after bind mounting installer resources"
 
   # No need to ask for sudo during the installation (omarchy itself responsible for removing after install)
   mkdir -p /mnt/etc/sudoers.d
@@ -125,8 +228,11 @@ EOF
   chmod 440 /mnt/etc/sudoers.d/99-omarchy-installer
 
   # Copy the local omarchy repo to the user's home directory
+  ensure_zfs_target_mounts_if_needed "before copying Omarchy source"
   mkdir -p /mnt/home/$OMARCHY_USER/.local/share/
   cp -r /root/omarchy /mnt/home/$OMARCHY_USER/.local/share/
+  ensure_zfs_target_mounts_if_needed "after copying Omarchy source"
+  assert_zfs_chroot_home_mount_if_needed "after copying Omarchy source"
 
   chown -R 1000:1000 /mnt/home/$OMARCHY_USER/.local/
 
@@ -136,6 +242,282 @@ EOF
   chmod +x /mnt/home/$OMARCHY_USER/.local/share/omarchy/default/waybar/indicators/screen-recording.sh 2>/dev/null || true
   chmod +x /mnt/home/$OMARCHY_USER/.local/share/omarchy/default/waybar/indicators/idle.sh 2>/dev/null || true
   chmod +x /mnt/home/$OMARCHY_USER/.local/share/omarchy/default/waybar/indicators/notification-silencing.sh 2>/dev/null || true
+
+  if [[ ! -f /mnt/home/$OMARCHY_USER/.local/share/omarchy/install.sh ]]; then
+    echo "Expected Omarchy source in /mnt/home/$OMARCHY_USER/.local/share/omarchy" >&2
+    exit 1
+  fi
+}
+
+partition_path() {
+  if [[ $1 =~ [0-9]$ ]]; then
+    printf '%sp%s' "$1" "$2"
+  else
+    printf '%s%s' "$1" "$2"
+  fi
+}
+
+kernel_headers_for() {
+  case "$1" in
+    linux) printf 'linux-headers' ;;
+    linux-t2) printf 'linux-t2-headers' ;;
+    *) printf '%s-headers' "$1" ;;
+  esac
+}
+
+append_archzfs_repo() {
+  local pacman_conf="$1"
+
+  if ! grep -q '^\[archzfs\]' "$pacman_conf"; then
+    cat >>"$pacman_conf" <<'EOF'
+
+[archzfs]
+SigLevel = Never
+Server = https://github.com/archzfs/archzfs/releases/download/experimental
+EOF
+  fi
+}
+
+ensure_zfs_target_mounts() {
+  local pool="$1"
+  local context="${2:-unspecified}"
+  local root_fstype home_source log_source
+
+  zfs mount "$pool/ROOT/default" >/dev/null 2>&1 || true
+  zfs mount -a
+
+  root_fstype=$(findmnt -n -o FSTYPE --target /mnt 2>/dev/null || true)
+  home_source=$(findmnt -n -o SOURCE --mountpoint /mnt/home 2>/dev/null || true)
+  log_source=$(findmnt -n -o SOURCE --mountpoint /mnt/var/log 2>/dev/null || true)
+
+  printf 'ZFS target mount check (%s): /mnt fstype=%s, /mnt/home source=%s, /mnt/var/log source=%s\n' "$context" "$root_fstype" "$home_source" "$log_source" >&2
+
+  if [[ $root_fstype != "zfs" ]]; then
+    echo "Expected /mnt to be mounted from ZFS during $context" >&2
+    findmnt -R /mnt >&2 || true
+    exit 1
+  fi
+  if [[ $home_source != "$pool/data/home" ]]; then
+    echo "Expected /mnt/home to be mounted from $pool/data/home during $context" >&2
+    findmnt -R /mnt >&2 || true
+    zfs list -o name,mountpoint,mounted >&2 || true
+    exit 1
+  fi
+  if [[ $log_source != "$pool/var/log" ]]; then
+    echo "Expected /mnt/var/log to be mounted from $pool/var/log during $context" >&2
+    findmnt -R /mnt >&2 || true
+    zfs list -o name,mountpoint,mounted >&2 || true
+    exit 1
+  fi
+}
+
+install_zfs_base_system() {
+  pacman-key --init
+  pacman-key --populate archlinux
+  pacman-key --populate omarchy
+  pacman -Sy --noconfirm
+
+  findmnt -R /mnt >/dev/null && umount -R /mnt
+
+  local disk boot_part zfs_part pool hostname timezone keyboard kernel_choice kernel_headers
+  local user_hash root_hash boot_uuid part_uuid zfs_device
+  disk=$(<disk.txt)
+  boot_part=$(partition_path "$disk" 1)
+  zfs_part=$(partition_path "$disk" 2)
+  pool="zroot"
+  hostname=$(<hostname.txt)
+  timezone=$(<timezone.txt)
+  keyboard=$(<keyboard.txt)
+  kernel_choice=$(jq -r '.kernels[0] // "linux"' user_configuration.json)
+  kernel_headers=$(kernel_headers_for "$kernel_choice")
+  user_hash=$(jq -r --arg user "$OMARCHY_USER" '.users[] | select(.username == $user) | .enc_password' user_credentials.json)
+  root_hash=$(jq -r '.root_enc_password' user_credentials.json)
+
+  if [[ ! -b $disk ]]; then
+    echo "Expected install disk $disk to exist" >&2
+    exit 1
+  fi
+
+  modprobe zfs
+
+  if zpool import -N -f "$pool" >/dev/null 2>&1; then
+    zpool destroy -f "$pool"
+  fi
+  zpool export "$pool" >/dev/null 2>&1 || true
+
+  for dev in "$disk" "${disk}"?*; do
+    [[ -b $dev ]] && wipefs -af "$dev" >/dev/null 2>&1 || true
+  done
+
+  sgdisk --zap-all "$disk"
+  sgdisk \
+    --new=1:1MiB:+2GiB --typecode=1:EF00 --change-name=1:EFI \
+    --new=2:0:0 --typecode=2:BF00 --change-name=2:zroot \
+    "$disk"
+  partprobe "$disk" >/dev/null 2>&1 || true
+  udevadm settle
+
+  for _ in {1..10}; do
+    [[ -b $boot_part && -b $zfs_part ]] && break
+    sleep 1
+    partprobe "$disk" >/dev/null 2>&1 || true
+    udevadm settle
+  done
+
+  if [[ ! -b $boot_part || ! -b $zfs_part ]]; then
+    echo "Expected partitions $boot_part and $zfs_part to exist" >&2
+    exit 1
+  fi
+
+  mkfs.fat -F32 -n EFI "$boot_part"
+
+  zfs_device="$zfs_part"
+  part_uuid=$(blkid -s PARTUUID -o value "$zfs_part" 2>/dev/null || true)
+  if [[ -n $part_uuid && -e /dev/disk/by-partuuid/$part_uuid ]]; then
+    zfs_device="/dev/disk/by-partuuid/$part_uuid"
+  fi
+
+  zpool create -f \
+    -o ashift=12 \
+    -o autotrim=on \
+    -O acltype=posixacl \
+    -O relatime=on \
+    -O xattr=sa \
+    -O dnodesize=auto \
+    -O normalization=formD \
+    -O mountpoint=none \
+    -O canmount=off \
+    -O devices=off \
+    -O compression=zstd \
+    -R /mnt \
+    "$pool" "$zfs_device"
+
+  zfs create -o mountpoint=none "$pool/ROOT"
+  zfs create -o mountpoint=/ -o canmount=noauto "$pool/ROOT/default"
+  zfs mount "$pool/ROOT/default"
+
+  zfs create -o mountpoint=none "$pool/data"
+  zfs create -o mountpoint=/home "$pool/data/home"
+  zfs create -o mountpoint=/root "$pool/data/root"
+  zfs create -o mountpoint=/srv "$pool/data/srv"
+  zfs create -o mountpoint=/var -o canmount=off "$pool/var"
+  zfs create "$pool/var/log"
+  zfs create -o mountpoint=/var/log/journal -o acltype=posixacl "$pool/var/log/journal"
+  zfs create "$pool/var/cache"
+  zfs create "$pool/var/tmp"
+  zfs create -o mountpoint=/var/lib -o canmount=off "$pool/var/lib"
+  zfs create "$pool/var/lib/docker"
+  zfs create "$pool/var/lib/libvirt"
+  zfs create "$pool/var/lib/machines"
+  zpool set bootfs="$pool/ROOT/default" "$pool"
+  zpool set cachefile=/etc/zfs/zpool.cache "$pool"
+  ensure_zfs_target_mounts "$pool" "after creating and mounting ZFS datasets"
+
+  mkdir -p /mnt/boot /mnt/etc/zfs
+  mount "$boot_part" /mnt/boot
+  cp /etc/zfs/zpool.cache /mnt/etc/zfs/zpool.cache
+
+  pacstrap -K /mnt \
+    base \
+    base-devel \
+    "$kernel_choice" \
+    "$kernel_headers" \
+    linux-firmware \
+    zfs-utils-git \
+    zfs-dkms-git \
+    dkms \
+    limine \
+    sudo \
+    git \
+    amd-ucode \
+    intel-ucode \
+    omarchy-keyring
+  ensure_zfs_target_mounts "$pool" "after pacstrap"
+
+  boot_uuid=$(blkid -s UUID -o value "$boot_part")
+  cat >/mnt/etc/fstab <<EOF
+UUID=$boot_uuid /boot vfat umask=0077 0 2
+EOF
+
+  cat >/mnt/root/configure-zfs-target.sh <<EOF
+#!/bin/bash
+set -euo pipefail
+
+ln -sf /usr/share/zoneinfo/$timezone /etc/localtime
+hwclock --systohc
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+printf 'LANG=en_US.UTF-8\n' >/etc/locale.conf
+printf 'KEYMAP=$keyboard\n' >/etc/vconsole.conf
+printf '$hostname\n' >/etc/hostname
+
+cat >/etc/hosts <<HOSTS
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 $hostname.localdomain $hostname
+HOSTS
+
+printf 'root:%s\n' '$root_hash' | chpasswd -e
+useradd -m -G wheel -s /bin/bash '$OMARCHY_USER'
+install -d -m 700 -o '$OMARCHY_USER' -g '$OMARCHY_USER' '/home/$OMARCHY_USER'
+printf '%s:%s\n' '$OMARCHY_USER' '$user_hash' | chpasswd -e
+cat >/etc/tmpfiles.d/$OMARCHY_USER-home.conf <<TMPFILES
+d /home/$OMARCHY_USER 0700 $OMARCHY_USER $OMARCHY_USER -
+TMPFILES
+printf '%%wheel ALL=(ALL:ALL) ALL\n' >/etc/sudoers.d/10-wheel
+chmod 0440 /etc/sudoers.d/10-wheel
+
+chmod 1777 /var/tmp
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+zgenhostid deadbeef
+zpool set cachefile=/etc/zfs/zpool.cache $pool
+
+sed -i 's/^MODULES=.*/MODULES=(zfs)/' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block zfs filesystems)/' /etc/mkinitcpio.conf
+# In a chroot, uname -r is still the live ISO kernel. Build only for target kernels.
+for modules_dir in /usr/lib/modules/*; do
+  [[ -d "\$modules_dir" ]] || continue
+  dkms autoinstall -k "\$(basename "\$modules_dir")"
+done
+mkinitcpio -P
+
+mkdir -p /boot/EFI/BOOT /boot/EFI/arch-limine
+cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/BOOTX64.EFI
+cp /usr/share/limine/BOOTX64.EFI /boot/EFI/arch-limine/BOOTX64.EFI
+
+cat >/boot/EFI/BOOT/limine.conf <<LIMINE
+timeout: 3
+
+/+Arch Linux ZFS
+    protocol: linux
+    path: boot():/vmlinuz-$kernel_choice
+    cmdline: root=ZFS=$pool/ROOT/default rw zfs_boot_only=1 console=ttyS0,115200n8 console=tty1
+    module_path: boot():/initramfs-$kernel_choice.img
+
+/+Arch Linux ZFS fallback
+    protocol: linux
+    path: boot():/vmlinuz-$kernel_choice
+    cmdline: root=ZFS=$pool/ROOT/default rw zfs_boot_only=1 console=ttyS0,115200n8 console=tty1
+    module_path: boot():/initramfs-$kernel_choice-fallback.img
+LIMINE
+
+cp /boot/EFI/BOOT/limine.conf /boot/EFI/arch-limine/limine.conf
+
+systemctl enable systemd-networkd.service
+systemctl enable systemd-resolved.service
+systemctl enable serial-getty@ttyS0.service
+systemctl enable zfs-import-cache.service
+systemctl enable zfs-import.target
+systemctl enable zfs-mount.service
+systemctl enable zfs.target
+EOF
+
+  chmod +x /mnt/root/configure-zfs-target.sh
+  arch-chroot /mnt /root/configure-zfs-target.sh
+  rm /mnt/root/configure-zfs-target.sh
+
+  ensure_zfs_target_mounts "$pool" "after configuring ZFS target"
+  prepare_target_for_omarchy
 }
 
 chroot_bash() {
@@ -145,6 +527,7 @@ chroot_bash() {
     OMARCHY_USER_NAME="$(<user_full_name.txt)" \
     OMARCHY_USER_EMAIL="$(<user_email_address.txt)" \
     OMARCHY_MIRROR="$OMARCHY_MIRROR" \
+    OMARCHY_ZFS_HOME_PROBE="$(zfs_home_probe_name)" \
     USER="$OMARCHY_USER" \
     HOME="/home/$OMARCHY_USER" \
     /bin/bash "$@"

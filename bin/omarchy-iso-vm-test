@@ -10,7 +10,7 @@ CURRENT_LINK="$WORK_DIR/current"
 usage() {
   cat <<'USAGE'
 Usage:
-  omarchy-iso-vm-test [run] [--iso PATH] [--no-build] [--reuse-disk] [--no-interactive-on-failure]
+  omarchy-iso-vm-test [run] [--iso PATH] [--no-build] [--reuse-disk] [--filesystem btrfs|zfs] [--no-interactive-on-failure]
   omarchy-iso-vm-test key KEY
   omarchy-iso-vm-test screenshot [PATH]
   omarchy-iso-vm-test screen
@@ -23,9 +23,12 @@ Environment:
   OMARCHY_TEST_USER                  Installer username (default: omarchy)
   OMARCHY_TEST_PASSWORD              Installer/root/encryption password (default: omarchy)
   OMARCHY_TEST_HOSTNAME              Installed hostname (default: omarchy-test)
+  OMARCHY_TEST_FILESYSTEM            Root filesystem to select: btrfs or zfs (default: btrfs)
   OMARCHY_TEST_VNC_DISPLAY           VNC display number (default: 5, port 5905)
   OMARCHY_TEST_INTERACTIVE_ON_FAILURE Keep VM open on failure (default: 1)
   OMARCHY_TEST_TIMEOUT               Install timeout in seconds (default: 7200)
+  OMARCHY_TEST_POST_BOOT_VERIFY      Boot and verify installed ZFS VM after install (default: 1 for ZFS)
+  OMARCHY_TEST_POST_BOOT_TIMEOUT     Post-boot verification timeout in seconds (default: 1200)
 
 While a VM is running, connect with: vncviewer 127.0.0.1:5905
 USAGE
@@ -231,10 +234,211 @@ find_ovmf_vars() {
       edk2-i386-vars.fd
 }
 
+write_boot_helper() {
+  local state_dir="$1"
+  local disk="$2"
+  local ovmf_code="$3"
+  local ovmf_vars="$4"
+  local helper="$state_dir/boot-installed.sh"
+
+  cat >"$helper" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+disk="$disk"
+ovmf_vars="$ovmf_vars"
+ovmf_code="\${OMARCHY_OVMF_CODE:-$ovmf_code}"
+ssh_port="\${OMARCHY_VM_SSH_PORT:-2222}"
+smp="\${OMARCHY_VM_SMP:-4}"
+memory="\${OMARCHY_VM_MEMORY:-8192}"
+
+echo "Booting installed Omarchy VM"
+echo "Disk: \$disk"
+echo "Display: QEMU GTK window"
+echo "SSH forward: localhost:\$ssh_port -> guest:22"
+
+exec qemu-system-x86_64 \
+  -enable-kvm \
+  -machine q35,accel=kvm \
+  -cpu host \
+  -smp "\$smp" \
+  -m "\$memory" \
+  -display gtk,gl=off,zoom-to-fit=on \
+  -device virtio-vga,xres=1280,yres=800 \
+  -device virtio-keyboard-pci \
+  -device virtio-mouse-pci \
+  -drive if=pflash,format=raw,readonly=on,file="\$ovmf_code" \
+  -drive if=pflash,format=raw,file="\$ovmf_vars" \
+  -drive if=none,id=vdisk,file="\$disk",format=qcow2,cache=writeback,discard=unmap \
+  -device virtio-blk-pci,drive=vdisk,serial=omarchy-vm,bootindex=1 \
+  -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"\$ssh_port"-:22
+EOF
+
+  chmod +x "$helper"
+  bash -n "$helper"
+  echo "Installed VM boot helper: $helper"
+}
+
+verify_zfs_boot() {
+  local state_dir="$1"
+  local disk="$2"
+  local ovmf_code="$3"
+  local ovmf_vars="$4"
+  local test_user="$5"
+  local test_password="$6"
+  local test_hostname="$7"
+  local ssh_port="$8"
+  local smp="$9"
+  local memory="${10}"
+  local timeout_seconds="${11}"
+
+  local qemu_args=(
+    qemu-system-x86_64
+    -enable-kvm
+    -machine q35,accel=kvm
+    -cpu host
+    -smp "$smp"
+    -m "$memory"
+    -display none
+    -serial stdio
+    -no-reboot
+    -drive if=pflash,format=raw,readonly=on,file="$ovmf_code"
+    -drive if=pflash,format=raw,file="$ovmf_vars"
+    -drive if=none,id=vdisk,file="$disk",format=qcow2,cache=writeback,discard=unmap
+    -device virtio-blk-pci,drive=vdisk,serial=omarchy-iso-vm-test,bootindex=1
+    -boot menu=off,strict=on
+    -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"$ssh_port"-:22
+  )
+
+  echo "Booting installed ZFS VM for verification"
+  echo "Post-boot serial log: $state_dir/post-boot-serial.log"
+
+  expect -f - \
+    "$state_dir" \
+    "$test_user" \
+    "$test_password" \
+    "$test_hostname" \
+    "$timeout_seconds" \
+    "${qemu_args[@]}" <<'EXPECT'
+set state_dir [lindex $argv 0]
+set test_user [lindex $argv 1]
+set test_password [lindex $argv 2]
+set test_hostname [lindex $argv 3]
+set boot_timeout [lindex $argv 4]
+set qemu_argv [lrange $argv 5 end]
+set verify_ok 0
+
+log_file -a "$state_dir/post-boot-serial.log"
+log_user 1
+match_max 65536
+
+proc fail {message} {
+  global state_dir
+
+  puts stderr "\nInstalled VM verification failed: $message"
+  puts stderr "Artifacts: $state_dir"
+  exit 1
+}
+
+proc shell_quote {value} {
+  regsub -all {'} $value {'"'"'} escaped
+  return "'$escaped'"
+}
+
+spawn {*}$qemu_argv
+set timeout $boot_timeout
+
+expect {
+  -re {no pools available to import} {
+    fail "ZFS initramfs emitted unexpected pool import message"
+  }
+  -re "$test_hostname login:" {
+    send -- "$test_user\r"
+  }
+  -re {login:} {
+    send -- "$test_user\r"
+  }
+  eof {
+    fail "VM exited before installed login prompt"
+  }
+  timeout {
+    fail "timed out waiting for installed login prompt"
+  }
+}
+
+expect {
+  -re {Password:} {
+    send -- "$test_password\r"
+  }
+  eof {
+    fail "VM exited before password prompt"
+  }
+  timeout {
+    fail "timed out waiting for password prompt"
+  }
+}
+
+expect {
+  -re {[$#] $} {}
+  -re {type=shell;cwd=} {
+    after 500
+  }
+  eof {
+    fail "VM exited before shell prompt"
+  }
+  timeout {
+    fail "timed out waiting for shell prompt"
+  }
+}
+
+send -- "stty -echo; printf '\\n__POST_VERIFY_STTY_DONE__\\n'\r"
+expect {
+  -re {__POST_VERIFY_STTY_DONE__} {}
+  eof {
+    fail "VM exited before post-boot verification stty setup"
+  }
+  timeout {
+    fail "timed out waiting for post-boot verification stty setup"
+  }
+}
+
+set verify_cmd "sudo_password=[shell_quote $test_password]; "
+append verify_cmd {(set -e; check() { printf 'check: %s\n' "$1"; shift; "$@"; }; check_not() { printf 'check: not %s\n' "$1"; shift; if "$@"; then return 1; fi; }; printf '\n__POST_VERIFY_START__\n'; printf '%s\n' "$sudo_password" | sudo -S -p '' -v; sudo_password=; fstype=$(findmnt -n -o FSTYPE /); printf 'root_fstype=%s\n' "$fstype"; check 'root filesystem is zfs' test "$fstype" = zfs; home_source=$(findmnt -n -o SOURCE /home); printf 'home_source=%s\n' "$home_source"; check 'home is zroot/data/home' test "$home_source" = zroot/data/home; uname -r; check 'zpool zroot is healthy' sudo -n zpool status zroot; check 'zfs root and home datasets exist' sudo -n zfs list -H -o name,mountpoint zroot/ROOT/default zroot/data/home; check 'limine config exists' sudo -n test -f /boot/limine.conf; check 'limine has entries' sudo -n grep -q '^/+' /boot/limine.conf; check 'limine uses zfs root' sudo -n grep -q 'root=ZFS=zroot/ROOT/default' /boot/limine.conf; check 'limine uses zfs boot-only import' sudo -n grep -q 'zfs_boot_only=1' /boot/limine.conf; check 'mkinitcpio hooks include zfs' sudo -n grep -q 'zfs filesystems)' /etc/mkinitcpio.conf.d/omarchy_hooks.conf; check_not 'mkinitcpio hooks include zfs fsck' sudo -n grep -q 'zfs filesystems fsck' /etc/mkinitcpio.conf.d/omarchy_hooks.conf; check 'visible Omarchy source directory exists' test -d "$HOME/.local/share/omarchy"; check 'visible Omarchy install script exists' test -f "$HOME/.local/share/omarchy/install.sh"; check 'visible Hypr config exists' test -f "$HOME/.config/hypr/hyprland.conf"; check 'Hypr config sources Omarchy autostart' grep -q 'source = ~/.local/share/omarchy/default/hypr/autostart.conf' "$HOME/.config/hypr/hyprland.conf"; check 'visible Omarchy install log exists' sudo -n test -f /var/log/omarchy-install.log; check 'archzfs repo is configured' grep -q '^\[archzfs\]' /etc/pacman.conf; check 'ZFS packages are installed' pacman -Q zfs-dkms-git zfs-utils-git limine-mkinitcpio-hook; check 'sddm is enabled' systemctl is-enabled sddm.service; check_not 'swapfile is in fstab' grep -q '/swap/swapfile' /etc/fstab; check_not 'resume config exists' sudo -n test -f /etc/mkinitcpio.conf.d/omarchy_resume.conf; check 'no failed systemd units' test -z "$(systemctl --failed --no-legend)"; printf '\n__POST_VERIFY_OK__\n'); rc=$?; sudo_password=; printf '\n__POST_VERIFY_EXIT:%s__\n' "$rc"; sudo -n poweroff}
+send -- "$verify_cmd\r"
+
+set timeout $boot_timeout
+expect {
+  -re {__POST_VERIFY_OK__} {
+    set verify_ok 1
+    exp_continue
+  }
+  -re {__POST_VERIFY_EXIT:0__} {
+    set verify_ok 1
+    exp_continue
+  }
+  -re {__POST_VERIFY_EXIT:([1-9][0-9]*)__} {
+    fail "post-boot verification command exited with failure"
+  }
+  eof {
+    if {$verify_ok} {
+      puts "Installed ZFS VM boot verification passed"
+      exit 0
+    }
+
+    fail "VM exited before post-boot verification completed"
+  }
+  timeout {
+    fail "timed out waiting for post-boot verification"
+  }
+}
+EXPECT
+}
+
 run_test() {
   local build=1
   local iso=""
   local reuse_disk=0
+  local filesystem="${OMARCHY_TEST_FILESYSTEM:-btrfs}"
   local interactive_on_failure="${OMARCHY_TEST_INTERACTIVE_ON_FAILURE:-1}"
 
   while [[ $# -gt 0 ]]; do
@@ -251,6 +455,10 @@ run_test() {
       --reuse-disk)
         reuse_disk=1
         shift
+        ;;
+      --filesystem)
+        filesystem="$2"
+        shift 2
         ;;
       --no-interactive-on-failure)
         interactive_on_failure=0
@@ -270,6 +478,15 @@ run_test() {
 
   ensure_run_dependencies "$build"
 
+  case "$filesystem" in
+    btrfs|zfs) ;;
+    *)
+      echo "Unsupported filesystem: $filesystem" >&2
+      echo "Expected: btrfs or zfs" >&2
+      exit 1
+      ;;
+  esac
+
   local omarchy_path="${OMARCHY_TEST_OMARCHY_PATH:-$HOME/src/omarchy}"
 
   if [[ "$build" == "1" ]]; then
@@ -280,7 +497,7 @@ run_test() {
     fi
 
     echo "Building ISO from local Omarchy source: $omarchy_path"
-    OMARCHY_ISO_SKIP_PACMAN_CACHE_CLEAR=1 OMARCHY_PATH="$omarchy_path" "$SCRIPT_DIR/omarchy-iso-make" --local-source --no-boot-offer
+    OMARCHY_ISO_SKIP_PACMAN_CACHE_CLEAR=1 OMARCHY_PATH="$omarchy_path" "$SCRIPT_DIR/omarchy-iso-make" --local-source --no-cache --no-boot-offer
     iso="$(latest_iso)"
   elif [[ -z "$iso" ]]; then
     iso="$(latest_iso)"
@@ -326,7 +543,7 @@ run_test() {
   cp "$ovmf_vars_template" "$ovmf_vars"
   chmod u+w "$ovmf_vars"
 
-  local hmp_socket vnc_display vnc_port ssh_port width height smp memory timeout_seconds
+  local hmp_socket vnc_display vnc_port ssh_port width height smp memory timeout_seconds post_boot_timeout_seconds
   hmp_socket="$state_dir/monitor.sock"
   vnc_display="${OMARCHY_TEST_VNC_DISPLAY:-5}"
   vnc_port=$((5900 + vnc_display))
@@ -336,6 +553,7 @@ run_test() {
   smp="${OMARCHY_TEST_SMP:-4}"
   memory="${OMARCHY_TEST_MEMORY:-8192}"
   timeout_seconds="${OMARCHY_TEST_TIMEOUT:-7200}"
+  post_boot_timeout_seconds="${OMARCHY_TEST_POST_BOOT_TIMEOUT:-1200}"
 
   local qemu_args=(
     qemu-system-x86_64
@@ -363,6 +581,7 @@ run_test() {
   cat >"$state_dir/run.env" <<EOF
 ISO=$iso
 DISK=$disk
+FILESYSTEM=$filesystem
 VNC=127.0.0.1:$vnc_port
 HMP_SOCKET=$hmp_socket
 SERIAL_LOG=$state_dir/serial.log
@@ -381,6 +600,7 @@ EOF
     "${OMARCHY_TEST_USER:-omarchy}" \
     "${OMARCHY_TEST_PASSWORD:-omarchy}" \
     "${OMARCHY_TEST_HOSTNAME:-omarchy-test}" \
+    "$filesystem" \
     "$timeout_seconds" \
     "$vnc_display" \
     "$interactive_on_failure" \
@@ -391,14 +611,16 @@ set state_dir [lindex $argv 1]
 set test_user [lindex $argv 2]
 set test_password [lindex $argv 3]
 set test_hostname [lindex $argv 4]
-set install_timeout [lindex $argv 5]
-set vnc_display [lindex $argv 6]
-set interactive_on_failure [lindex $argv 7]
-set log_serial_stdout [lindex $argv 8]
-set qemu_argv [lrange $argv 9 end]
+set test_filesystem [lindex $argv 5]
+set install_timeout [lindex $argv 6]
+set vnc_display [lindex $argv 7]
+set interactive_on_failure [lindex $argv 8]
+set log_serial_stdout [lindex $argv 9]
+set qemu_argv [lrange $argv 10 end]
 
 set install_ok 0
 set install_seen 0
+set install_reboot_confirmed 0
 set screen_id 0
 
 log_file -a "$state_dir/serial.log"
@@ -683,7 +905,7 @@ proc start_completion_watcher {} {
 }
 
 proc wait_install {seconds} {
-  global install_ok install_seen
+  global install_ok install_reboot_confirmed install_seen
 
   puts "Waiting for Omarchy installation to finish"
   set deadline [expr {[clock seconds] + $seconds}]
@@ -704,6 +926,11 @@ proc wait_install {seconds} {
 
     if {[regexp -nocase {(Finished installing|Installed in|Installation completed without any errors|Rebooting system)} $screen]} {
       set install_seen 1
+    }
+
+    if {!$install_reboot_confirmed && [regexp -nocase {Reboot Now} $screen]} {
+      set install_reboot_confirmed 1
+      send_key ret
     }
 
     if {$install_ok} {
@@ -803,11 +1030,34 @@ send_key y
 wait_screen "disk selector" {Select install disk} 120
 send_key ret
 
+wait_screen "filesystem selector" {Select root filesystem} 120
+if {$test_filesystem eq "zfs"} {
+  send_key down
+}
+send_key ret
+
 wait_screen "disk overwrite confirmation" {Confirm overwriting} 120
 send_key y
 
 wait_install $install_timeout
 EXPECT
+
+  if [[ "$filesystem" == "zfs" && "${OMARCHY_TEST_POST_BOOT_VERIFY:-1}" == "1" ]]; then
+    verify_zfs_boot \
+      "$state_dir" \
+      "$disk" \
+      "$ovmf_code" \
+      "$ovmf_vars" \
+      "${OMARCHY_TEST_USER:-omarchy}" \
+      "${OMARCHY_TEST_PASSWORD:-omarchy}" \
+      "${OMARCHY_TEST_HOSTNAME:-omarchy-test}" \
+      "$ssh_port" \
+      "$smp" \
+      "$memory" \
+      "$post_boot_timeout_seconds"
+  fi
+
+  write_boot_helper "$state_dir" "$disk" "$ovmf_code" "$ovmf_vars"
 }
 
 command="${1:-run}"

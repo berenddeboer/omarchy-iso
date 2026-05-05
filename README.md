@@ -26,7 +26,7 @@ OMARCHY_INSTALLER_REPO="myuser/omarchy-fork" OMARCHY_INSTALLER_REF="some-feature
 
 Run `./bin/omarchy-iso-boot [release/omarchy.iso]` for a manual smoke test. Without an ISO argument it uses `gum` to choose an ISO and ask whether to reuse the disk.
 
-For an automated local VM install test that still exposes the full interactive display, run `./bin/omarchy-iso-vm-test`. It builds from `~/src/omarchy`, boots the ISO in a KVM/QEMU VM with VNC on `127.0.0.1:5905`, drives the visible installer prompts, and saves serial logs, tty screenshots, and screen text under `release/vm-test/current`. This runner does not use `gum` on the host side.
+For an automated local VM install test that still exposes the full interactive display, run `./bin/omarchy-iso-vm-test`. It builds from `~/src/omarchy`, boots the ISO in a KVM/QEMU VM with VNC on `127.0.0.1:5905`, drives the visible installer prompts, and saves serial logs, tty screenshots, and screen text under `release/vm-test/current`. This runner does not use `gum` on the host side. Use `OMARCHY_TEST_FILESYSTEM=zfs ./bin/omarchy-iso-vm-test` or `./bin/omarchy-iso-vm-test --filesystem zfs` to exercise the ZFS install path; that test also boots the installed VM and verifies the ZFS root.
 
 While the VM is running, you can send keys or capture the display from another terminal:
 
