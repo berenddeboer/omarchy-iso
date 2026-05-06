@@ -111,10 +111,12 @@ user_form() {
     password=$(gum input --placeholder "Used for user + root + encryption" --prompt.foreground="#845DF9" --password --prompt "Password> ") || abort
     password_confirmation=$(gum input --placeholder "Must match the password you just typed" --prompt.foreground="#845DF9" --password --prompt "Confirm> ") || abort
 
-    if [[ -n "$password" && "$password" == "$password_confirmation" ]]; then
+    if [[ -n "$password" && "$password" == "$password_confirmation" && ${#password} -ge 8 ]]; then
       break
     elif [[ -z "$password" ]]; then
       notice "Your password can't be blank!" 1
+    elif [[ ${#password} -lt 8 ]]; then
+      notice "Your password must be at least 8 characters for encryption" 1
     else
       notice "Passwords didn't match!" 1
     fi
@@ -270,7 +272,7 @@ filesystem_form() {
   step "Let's choose the root filesystem..."
 
   local choice
-  choice=$(printf 'Btrfs (encrypted, snapshots)\nZFS (unencrypted, experimental)' | gum choose --selected "Btrfs (encrypted, snapshots)" --header "Select root filesystem") || abort
+  choice=$(printf 'Btrfs (encrypted, snapshots)\nZFS (encrypted home, experimental)' | gum choose --selected "Btrfs (encrypted, snapshots)" --header "Select root filesystem") || abort
 
   case "$choice" in
     "Btrfs"*) root_filesystem="btrfs" ;;

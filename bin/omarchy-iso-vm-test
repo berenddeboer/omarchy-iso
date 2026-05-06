@@ -21,7 +21,7 @@ then boots that ISO in a KVM VM with VNC visibility and drives the real installe
 Environment:
   OMARCHY_TEST_OMARCHY_PATH          Local Omarchy checkout (default: ~/src/omarchy)
   OMARCHY_TEST_USER                  Installer username (default: omarchy)
-  OMARCHY_TEST_PASSWORD              Installer/root/encryption password (default: omarchy)
+  OMARCHY_TEST_PASSWORD              Installer/root/encryption password (default: omarchy1)
   OMARCHY_TEST_HOSTNAME              Installed hostname (default: omarchy-test)
   OMARCHY_TEST_FILESYSTEM            Root filesystem to select: btrfs or zfs (default: btrfs)
   OMARCHY_TEST_VNC_DISPLAY           VNC display number (default: 5, port 5905)
@@ -403,13 +403,66 @@ expect {
 }
 
 set verify_cmd "sudo_password=[shell_quote $test_password]; "
-append verify_cmd {(set -e; check() { printf 'check: %s\n' "$1"; shift; "$@"; }; check_not() { printf 'check: not %s\n' "$1"; shift; if "$@"; then return 1; fi; }; printf '\n__POST_VERIFY_START__\n'; printf '%s\n' "$sudo_password" | sudo -S -p '' -v; sudo_password=; fstype=$(findmnt -n -o FSTYPE /); printf 'root_fstype=%s\n' "$fstype"; check 'root filesystem is zfs' test "$fstype" = zfs; home_source=$(findmnt -n -o SOURCE /home); printf 'home_source=%s\n' "$home_source"; check 'home is zroot/data/home' test "$home_source" = zroot/data/home; uname -r; check 'zpool zroot is healthy' sudo -n zpool status zroot; check 'zfs root and home datasets exist' sudo -n zfs list -H -o name,mountpoint zroot/ROOT/default zroot/data/home; check 'limine config exists' sudo -n test -f /boot/limine.conf; check 'limine has entries' sudo -n grep -q '^/+' /boot/limine.conf; check 'limine uses zfs root' sudo -n grep -q 'root=ZFS=zroot/ROOT/default' /boot/limine.conf; check 'limine uses zfs boot-only import' sudo -n grep -q 'zfs_boot_only=1' /boot/limine.conf; check 'mkinitcpio hooks include zfs' sudo -n grep -q 'zfs filesystems)' /etc/mkinitcpio.conf.d/omarchy_hooks.conf; check_not 'mkinitcpio hooks include zfs fsck' sudo -n grep -q 'zfs filesystems fsck' /etc/mkinitcpio.conf.d/omarchy_hooks.conf; check 'visible Omarchy source directory exists' test -d "$HOME/.local/share/omarchy"; check 'visible Omarchy install script exists' test -f "$HOME/.local/share/omarchy/install.sh"; check 'visible Hypr config exists' test -f "$HOME/.config/hypr/hyprland.conf"; check 'Hypr config sources Omarchy autostart' grep -q 'source = ~/.local/share/omarchy/default/hypr/autostart.conf' "$HOME/.config/hypr/hyprland.conf"; check 'visible Omarchy install log exists' sudo -n test -f /var/log/omarchy-install.log; check 'archzfs repo is configured' grep -q '^\[archzfs\]' /etc/pacman.conf; check 'ZFS packages are installed' pacman -Q zfs-dkms-git zfs-utils-git limine-mkinitcpio-hook; check 'sddm is enabled' systemctl is-enabled sddm.service; check_not 'swapfile is in fstab' grep -q '/swap/swapfile' /etc/fstab; check_not 'resume config exists' sudo -n test -f /etc/mkinitcpio.conf.d/omarchy_resume.conf; check 'no failed systemd units' test -z "$(systemctl --failed --no-legend)"; printf '\n__POST_VERIFY_OK__\n'); rc=$?; sudo_password=; printf '\n__POST_VERIFY_EXIT:%s__\n' "$rc"; sudo -n poweroff}
+append verify_cmd {
+(set -e
+check() { printf 'check: %s\n' "$1"; shift; "$@"; }
+check_not() { printf 'check: not %s\n' "$1"; shift; if "$@"; then return 1; fi; }
+printf '\n__POST_VERIFY_START__\n'
+printf '%s\n' "$sudo_password" | sudo -S -p '' -v
+sudo_password=
+fstype=$(findmnt -n -o FSTYPE /)
+printf 'root_fstype=%s\n' "$fstype"
+check 'root filesystem is zfs' test "$fstype" = zfs
+home_parent_source=$(findmnt -n -o SOURCE /home)
+home_source=$(findmnt -n -o SOURCE "$HOME")
+printf 'home_parent_source=%s\n' "$home_parent_source"
+printf 'home_source=%s\n' "$home_source"
+check 'home parent is zroot/data/home' test "$home_parent_source" = zroot/data/home
+check 'user home is encrypted ZFS dataset' test "$home_source" = "zroot/data/home/$USER"
+uname -r
+check 'zpool zroot is healthy' sudo -n zpool status zroot
+check 'zfs root and home datasets exist' sudo -n zfs list -H -o name,mountpoint zroot/ROOT/default zroot/data/home "zroot/data/home/$USER"
+check 'user home encryption enabled' test "$(sudo -n zfs get -H -o value encryption "zroot/data/home/$USER")" != off
+check 'user home keyformat is passphrase' test "$(sudo -n zfs get -H -o value keyformat "zroot/data/home/$USER")" = passphrase
+check 'user home keylocation is prompt' test "$(sudo -n zfs get -H -o value keylocation "zroot/data/home/$USER")" = prompt
+check 'user home key is available' test "$(sudo -n zfs get -H -o value keystatus "zroot/data/home/$USER")" = available
+check 'pam_zfs_key module installed' sudo -n test -f /usr/lib/security/pam_zfs_key.so
+check 'ZFS PAM file exists' sudo -n test -f /etc/pam.d/zfs-key
+check 'system-auth includes ZFS PAM' sudo -n grep -Eq '^auth[[:space:]]+include[[:space:]]+zfs-key' /etc/pam.d/system-auth
+check 'ZFS PAM uses home dataset prefix' sudo -n grep -q 'pam_zfs_key.so homes=zroot/data/home' /etc/pam.d/zfs-key
+check_not 'SDDM autologin config exists' sudo -n test -f /etc/sddm.conf.d/autologin.conf
+check 'SDDM remembers installed user' sudo -n grep -q "^User=$USER$" /var/lib/sddm/state.conf
+check 'SDDM remembers Hyprland session' sudo -n grep -q '^Session=hyprland-uwsm$' /var/lib/sddm/state.conf
+check 'limine config exists' sudo -n test -f /boot/limine.conf
+check 'limine has entries' sudo -n grep -q '^/+' /boot/limine.conf
+check 'limine uses zfs root' sudo -n grep -q 'root=ZFS=zroot/ROOT/default' /boot/limine.conf
+check 'limine uses zfs boot-only import' sudo -n grep -q 'zfs_boot_only=1' /boot/limine.conf
+check 'mkinitcpio hooks include zfs' sudo -n grep -q 'zfs filesystems)' /etc/mkinitcpio.conf.d/omarchy_hooks.conf
+check_not 'mkinitcpio hooks include zfs fsck' sudo -n grep -q 'zfs filesystems fsck' /etc/mkinitcpio.conf.d/omarchy_hooks.conf
+check 'visible Omarchy source directory exists' test -d "$HOME/.local/share/omarchy"
+check 'visible Omarchy install script exists' test -f "$HOME/.local/share/omarchy/install.sh"
+check 'visible Hypr config exists' test -f "$HOME/.config/hypr/hyprland.conf"
+check 'Hypr config sources Omarchy autostart' grep -q 'source = ~/.local/share/omarchy/default/hypr/autostart.conf' "$HOME/.config/hypr/hyprland.conf"
+check 'visible Omarchy install log exists' sudo -n test -f /var/log/omarchy-install.log
+check 'archzfs repo is configured' grep -q '^\[archzfs\]' /etc/pacman.conf
+check 'ZFS packages are installed' pacman -Q zfs-dkms-git zfs-utils-git limine-mkinitcpio-hook
+check 'sddm is enabled' systemctl is-enabled sddm.service
+check_not 'swapfile is in fstab' grep -q '/swap/swapfile' /etc/fstab
+check_not 'resume config exists' sudo -n test -f /etc/mkinitcpio.conf.d/omarchy_resume.conf
+check 'no failed systemd units' test -z "$(systemctl --failed --no-legend)"
+printf '\n__POST_VERIFY_OK__\n')
+rc=$?
+sudo_password=
+printf '\n__POST_VERIFY_EXIT:%s__\n' "$rc"
+sudo -n poweroff
+}
 send -- "$verify_cmd\r"
 
 set timeout $boot_timeout
 expect {
   -re {__POST_VERIFY_OK__} {
     set verify_ok 1
+    send -- "sudo -n poweroff\r"
     exp_continue
   }
   -re {__POST_VERIFY_EXIT:0__} {
@@ -598,7 +651,7 @@ EOF
     "$hmp_socket" \
     "$state_dir" \
     "${OMARCHY_TEST_USER:-omarchy}" \
-    "${OMARCHY_TEST_PASSWORD:-omarchy}" \
+    "${OMARCHY_TEST_PASSWORD:-omarchy1}" \
     "${OMARCHY_TEST_HOSTNAME:-omarchy-test}" \
     "$filesystem" \
     "$timeout_seconds" \
@@ -1049,7 +1102,7 @@ EXPECT
       "$ovmf_code" \
       "$ovmf_vars" \
       "${OMARCHY_TEST_USER:-omarchy}" \
-      "${OMARCHY_TEST_PASSWORD:-omarchy}" \
+      "${OMARCHY_TEST_PASSWORD:-omarchy1}" \
       "${OMARCHY_TEST_HOSTNAME:-omarchy-test}" \
       "$ssh_port" \
       "$smp" \

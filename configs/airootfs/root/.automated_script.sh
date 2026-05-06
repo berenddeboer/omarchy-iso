@@ -47,6 +47,7 @@ install_omarchy() {
   assert_zfs_chroot_home_mount_if_needed "after Omarchy install"
 
   if [[ $(<root_filesystem.txt) == "zfs" ]]; then
+    configure_zfs_sddm_password_login
     append_archzfs_repo /mnt/etc/pacman.conf
   fi
 
@@ -98,6 +99,10 @@ zfs_home_probe_name() {
   printf '.omarchy-zfs-home-probe'
 }
 
+zfs_user_home_dataset() {
+  printf 'zroot/data/home/%s' "$OMARCHY_USER"
+}
+
 prepare_zfs_home_probe() {
   local user_ids probe_path
 
@@ -109,7 +114,7 @@ prepare_zfs_home_probe() {
 
   install -d -m 700 -o "${user_ids%:*}" -g "${user_ids#*:}" "/mnt/home/$OMARCHY_USER"
   probe_path="/mnt/home/$OMARCHY_USER/$(zfs_home_probe_name)"
-  printf 'zroot/data/home\n' >"$probe_path"
+  zfs_user_home_dataset >"$probe_path"
   chown "$user_ids" "$probe_path"
 }
 
@@ -132,7 +137,7 @@ assert_zfs_chroot_home_mount() {
   prepare_zfs_home_probe
   probe_name=$(zfs_home_probe_name)
 
-  chroot_bash -lc "context='$context'; probe=\"\$HOME/$probe_name\"; root_source=\$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null || true); printf 'ZFS chroot home path check (%s): / source=%s, HOME=%s, probe=%s\\n' \"\$context\" \"\$root_source\" \"\$HOME\" \"\$probe\" >&2; if [[ ! -f \$probe ]] || [[ \$(<\"\$probe\") != zroot/data/home ]]; then echo \"Expected chroot HOME to resolve to zroot/data/home during \$context\" >&2; findmnt -R / >&2 || true; ls -la /home /home/$OMARCHY_USER >&2 || true; exit 1; fi"
+  chroot_bash -lc "context='$context'; expected='$(zfs_user_home_dataset)'; probe=\"\$HOME/$probe_name\"; root_source=\$(findmnt -n -o SOURCE --mountpoint / 2>/dev/null || true); printf 'ZFS chroot home path check (%s): / source=%s, HOME=%s, probe=%s\\n' \"\$context\" \"\$root_source\" \"\$HOME\" \"\$probe\" >&2; if [[ ! -f \$probe ]] || [[ \$(<\"\$probe\") != \$expected ]]; then echo \"Expected chroot HOME to resolve to \$expected during \$context\" >&2; findmnt -R / >&2 || true; ls -la /home /home/$OMARCHY_USER >&2 || true; exit 1; fi"
 }
 
 # Set Tokyo Night color scheme for the terminal
@@ -278,19 +283,40 @@ EOF
   fi
 }
 
+configure_zfs_sddm_password_login() {
+  mkdir -p /mnt/etc/sddm.conf.d
+  cat >/mnt/etc/sddm.conf.d/omarchy-theme.conf <<EOF
+[Theme]
+Current=omarchy
+EOF
+  rm -f /mnt/etc/sddm.conf.d/autologin.conf
+
+  mkdir -p /mnt/var/lib/sddm
+  cat >/mnt/var/lib/sddm/state.conf <<EOF
+[Last]
+User=$OMARCHY_USER
+Session=hyprland-uwsm
+EOF
+  if chroot /mnt getent passwd sddm >/dev/null 2>&1; then
+    chroot /mnt chown sddm:sddm /var/lib/sddm/state.conf
+  fi
+}
+
 ensure_zfs_target_mounts() {
   local pool="$1"
   local context="${2:-unspecified}"
-  local root_fstype home_source log_source
+  local root_fstype home_source user_home_source log_source expected_user_home
 
   zfs mount "$pool/ROOT/default" >/dev/null 2>&1 || true
   zfs mount -a
 
   root_fstype=$(findmnt -n -o FSTYPE --target /mnt 2>/dev/null || true)
   home_source=$(findmnt -n -o SOURCE --mountpoint /mnt/home 2>/dev/null || true)
+  user_home_source=$(findmnt -n -o SOURCE --mountpoint "/mnt/home/$OMARCHY_USER" 2>/dev/null || true)
   log_source=$(findmnt -n -o SOURCE --mountpoint /mnt/var/log 2>/dev/null || true)
+  expected_user_home=$(zfs_user_home_dataset)
 
-  printf 'ZFS target mount check (%s): /mnt fstype=%s, /mnt/home source=%s, /mnt/var/log source=%s\n' "$context" "$root_fstype" "$home_source" "$log_source" >&2
+  printf 'ZFS target mount check (%s): /mnt fstype=%s, /mnt/home source=%s, /mnt/home/%s source=%s, /mnt/var/log source=%s\n' "$context" "$root_fstype" "$home_source" "$OMARCHY_USER" "$user_home_source" "$log_source" >&2
 
   if [[ $root_fstype != "zfs" ]]; then
     echo "Expected /mnt to be mounted from ZFS during $context" >&2
@@ -300,13 +326,19 @@ ensure_zfs_target_mounts() {
   if [[ $home_source != "$pool/data/home" ]]; then
     echo "Expected /mnt/home to be mounted from $pool/data/home during $context" >&2
     findmnt -R /mnt >&2 || true
-    zfs list -o name,mountpoint,mounted >&2 || true
+    zfs list -o name,mountpoint,mounted,encryption,keystatus >&2 || true
+    exit 1
+  fi
+  if [[ $user_home_source != "$expected_user_home" ]]; then
+    echo "Expected /mnt/home/$OMARCHY_USER to be mounted from $expected_user_home during $context" >&2
+    findmnt -R /mnt >&2 || true
+    zfs list -o name,mountpoint,mounted,encryption,keystatus >&2 || true
     exit 1
   fi
   if [[ $log_source != "$pool/var/log" ]]; then
     echo "Expected /mnt/var/log to be mounted from $pool/var/log during $context" >&2
     findmnt -R /mnt >&2 || true
-    zfs list -o name,mountpoint,mounted >&2 || true
+    zfs list -o name,mountpoint,mounted,encryption,keystatus >&2 || true
     exit 1
   fi
 }
@@ -320,7 +352,7 @@ install_zfs_base_system() {
   findmnt -R /mnt >/dev/null && umount -R /mnt
 
   local disk boot_part zfs_part pool hostname timezone keyboard kernel_choice kernel_headers
-  local user_hash root_hash boot_uuid part_uuid zfs_device
+  local user_hash root_hash encryption_password boot_uuid part_uuid zfs_device zfs_home_key zfs_home_dataset
   disk=$(<disk.txt)
   boot_part=$(partition_path "$disk" 1)
   zfs_part=$(partition_path "$disk" 2)
@@ -332,6 +364,12 @@ install_zfs_base_system() {
   kernel_headers=$(kernel_headers_for "$kernel_choice")
   user_hash=$(jq -r --arg user "$OMARCHY_USER" '.users[] | select(.username == $user) | .enc_password' user_credentials.json)
   root_hash=$(jq -r '.root_enc_password' user_credentials.json)
+  encryption_password=$(jq -r '.encryption_password' user_credentials.json)
+
+  if ((${#encryption_password} < 8)); then
+    echo "ZFS encrypted home requires an encryption password of at least 8 characters" >&2
+    exit 1
+  fi
 
   if [[ ! -b $disk ]]; then
     echo "Expected install disk $disk to exist" >&2
@@ -398,6 +436,25 @@ install_zfs_base_system() {
 
   zfs create -o mountpoint=none "$pool/data"
   zfs create -o mountpoint=/home "$pool/data/home"
+  zfs_home_dataset=$(zfs_user_home_dataset)
+  zfs_home_key=$(mktemp /tmp/omarchy-zfs-home-key.XXXXXX)
+  chmod 600 "$zfs_home_key"
+  printf '%s' "$encryption_password" >"$zfs_home_key"
+  if ! zfs create \
+    -o encryption=on \
+    -o keyformat=passphrase \
+    -o keylocation="file://$zfs_home_key" \
+    -o mountpoint="/home/$OMARCHY_USER" \
+    "$zfs_home_dataset"; then
+    rm -f "$zfs_home_key"
+    exit 1
+  fi
+  if ! zfs set keylocation=prompt "$zfs_home_dataset"; then
+    rm -f "$zfs_home_key"
+    exit 1
+  fi
+  rm -f "$zfs_home_key"
+  zfs_home_key=""
   zfs create -o mountpoint=/root "$pool/data/root"
   zfs create -o mountpoint=/srv "$pool/data/srv"
   zfs create -o mountpoint=/var -o canmount=off "$pool/var"
@@ -458,7 +515,7 @@ cat >/etc/hosts <<HOSTS
 HOSTS
 
 printf 'root:%s\n' '$root_hash' | chpasswd -e
-useradd -m -G wheel -s /bin/bash '$OMARCHY_USER'
+useradd -M -d '/home/$OMARCHY_USER' -G wheel -s /bin/bash '$OMARCHY_USER'
 install -d -m 700 -o '$OMARCHY_USER' -g '$OMARCHY_USER' '/home/$OMARCHY_USER'
 printf '%s:%s\n' '$OMARCHY_USER' '$user_hash' | chpasswd -e
 cat >/etc/tmpfiles.d/$OMARCHY_USER-home.conf <<TMPFILES
@@ -471,6 +528,28 @@ chmod 1777 /var/tmp
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
 zgenhostid deadbeef
 zpool set cachefile=/etc/zfs/zpool.cache $pool
+
+if [[ ! -f /usr/lib/security/pam_zfs_key.so ]]; then
+  echo "Expected pam_zfs_key.so to be installed by zfs-utils-git" >&2
+  exit 1
+fi
+
+cat >/etc/pam.d/zfs-key <<PAM
+#%PAM-1.0
+auth       [default=1 success=ignore] pam_succeed_if.so uid >= 1000 quiet
+auth       required                   pam_zfs_key.so homes=$pool/data/home runstatedir=/run/pam_zfs_key
+session    [default=2 success=ignore] pam_succeed_if.so uid >= 1000 quiet
+session    [success=1 default=ignore] pam_succeed_if.so service = systemd-user quiet
+session    optional                   pam_zfs_key.so homes=$pool/data/home runstatedir=/run/pam_zfs_key
+password   [default=1 success=ignore] pam_succeed_if.so uid >= 1000 quiet
+password   required                   pam_zfs_key.so homes=$pool/data/home runstatedir=/run/pam_zfs_key
+PAM
+
+for pam_file in /etc/pam.d/system-auth /etc/pam.d/su-l; do
+  grep -Eq '^auth[[:space:]]+include[[:space:]]+zfs-key' "\$pam_file" || sed -i '1aauth       include      zfs-key' "\$pam_file"
+  grep -Eq '^session[[:space:]]+include[[:space:]]+zfs-key' "\$pam_file" || sed -i '1asession    include      zfs-key' "\$pam_file"
+  grep -Eq '^password[[:space:]]+include[[:space:]]+zfs-key' "\$pam_file" || sed -i '1apassword   include      zfs-key' "\$pam_file"
+done
 
 sed -i 's/^MODULES=.*/MODULES=(zfs)/' /etc/mkinitcpio.conf
 sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block zfs filesystems)/' /etc/mkinitcpio.conf
