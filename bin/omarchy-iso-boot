@@ -1,13 +1,86 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 ISO="${1:-}"
 REUSE="${2:-}"
+QEMU="${OMARCHY_QEMU:-qemu-system-x86_64}"
+
+require_command() {
+  local command="$1"
+
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
+    exit 1
+  fi
+}
+
+find_first_file() {
+  local path
+
+  for path in "$@"; do
+    if [[ -f "$path" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_qemu_data_file() {
+  local data_dir name path
+
+  while IFS= read -r data_dir; do
+    for name in "$@"; do
+      path="${data_dir%/}/$name"
+      if [[ -f "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+      fi
+    done
+  done < <("$QEMU" -L help 2>/dev/null || true)
+
+  return 1
+}
+
+find_ovmf_code() {
+  if [[ -n "${OMARCHY_OVMF_CODE:-}" ]]; then
+    find_first_file "$OMARCHY_OVMF_CODE"
+    return
+  fi
+
+  find_first_file \
+    /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+    /usr/share/edk2/x64/OVMF_CODE.fd \
+    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+    /usr/share/qemu/edk2-x86_64-code.fd || \
+    find_qemu_data_file \
+      edk2-x86_64-code.fd \
+      OVMF_CODE.4m.fd \
+      OVMF_CODE.fd
+}
+
+find_ovmf_vars() {
+  if [[ -n "${OMARCHY_OVMF_VARS:-}" ]]; then
+    find_first_file "$OMARCHY_OVMF_VARS"
+    return
+  fi
+
+  find_first_file \
+    /usr/share/edk2/x64/OVMF_VARS.4m.fd \
+    /usr/share/edk2/x64/OVMF_VARS.fd \
+    /usr/share/edk2-ovmf/x64/OVMF_VARS.fd \
+    /usr/share/qemu/edk2-i386-vars.fd || \
+    find_qemu_data_file \
+      OVMF_VARS.4m.fd \
+      OVMF_VARS.fd \
+      edk2-i386-vars.fd
+}
 
 if [ $# -eq 0 ]; then
-  ISO=$(ls -t release/*.iso 2>/dev/null | gum choose --header "Select ISO to boot")
-  if gum confirm --default=false "Reuse existing disk?"; then
+  ISO=$(ls -t release/*.iso 2>/dev/null | gum choose --header "Select ISO to boot" || true)
+  if [[ -n "$ISO" ]] && gum confirm --default=false "Reuse existing disk?"; then
     REUSE="reuse"
   fi
 fi
@@ -18,22 +91,33 @@ if [ -z "$ISO" ]; then
   exit 1
 fi
 
-omarchy-pkg-add qemu-full edk2-ovmf
+require_command "$QEMU"
+require_command qemu-img
+
+OVMF_CODE="$(find_ovmf_code)" || {
+  echo "Could not find OVMF_CODE firmware. Set OMARCHY_OVMF_CODE." >&2
+  exit 1
+}
+
+OVMF_VARS_TEMPLATE="$(find_ovmf_vars)" || {
+  echo "Could not find OVMF_VARS firmware. Set OMARCHY_OVMF_VARS." >&2
+  exit 1
+}
 
 DISK="/tmp/omarchy-iso-boot.qcow2"
 BOOT_OPTION="menu=on"
 if [[ ! -f $DISK || $REUSE != "reuse" ]]; then
   qemu-img create -f qcow2 "$DISK" 40G
-  cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /tmp/OVMF_VARS.4m.fd
+  cp "$OVMF_VARS_TEMPLATE" /tmp/OVMF_VARS.4m.fd
   BOOT_OPTION="once=d,menu=on"
 fi
 
 # Boot the ISO once for installation, then prefer the installed disk after reboot.
-qemu-system-x86_64 \
+"$QEMU" \
   -cpu host -enable-kvm -machine q35,accel=kvm \
   -smp "$(nproc)" \
   -m 8192 \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+  -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.4m.fd \
   -drive file="$DISK",format=qcow2,if=none,id=drive0 \
   -device virtio-blk-pci,drive=drive0,bootindex=1 \
