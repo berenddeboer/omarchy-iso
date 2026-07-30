@@ -16,6 +16,7 @@
 #   --encrypt          Drive the encrypted install flow (default: unencrypted)
 #   --provision              Drive the deferred-provisioning install flow: no user during install, the
 #                      first boot runs omarchy-provision-owner and creates it there
+#   --filesystem FS    Install btrfs (default) or zfs
 #   --reuse-base       Skip the install phase if a base image already exists
 #   --install-only     Stop after producing the installed base image
 #   --sync-omarchy DIR Push DIR's test/acceptance into the guest before running
@@ -39,6 +40,7 @@ INSTALL_TIMEOUT=2400
 BOOT_TIMEOUT=600
 ENCRYPT=false
 PROVISION=false
+FILESYSTEM=btrfs
 REUSE_BASE=false
 INSTALL_ONLY=false
 KEEP_RUNNING=false
@@ -47,13 +49,14 @@ SYNC_DIR=""
 SYNC_ALL=false
 
 GUEST_USER="omarchy"
-GUEST_PASSWORD="omarchy"
+GUEST_PASSWORD="omarchy1"
 GUEST_HOSTNAME="omarchy-test"
 
 while (($#)); do
   case "$1" in
     --encrypt) ENCRYPT=true ;;
     --provision) PROVISION=true ;;
+    --filesystem) FILESYSTEM="$2"; shift ;;
     --reuse-base) REUSE_BASE=true ;;
     --install-only) INSTALL_ONLY=true ;;
     --keep-running) KEEP_RUNNING=true ;;
@@ -68,6 +71,19 @@ while (($#)); do
   esac
   shift
 done
+
+if [[ $FILESYSTEM != "btrfs" && $FILESYSTEM != "zfs" ]]; then
+  echo "Invalid filesystem '$FILESYSTEM'; expected btrfs or zfs" >&2
+  exit 1
+fi
+if [[ $FILESYSTEM == "zfs" && $ENCRYPT == true ]]; then
+  echo "ZFS encrypts the user home; --encrypt is only for Btrfs root encryption" >&2
+  exit 1
+fi
+if [[ $FILESYSTEM == "zfs" && $PROVISION == true ]]; then
+  echo "ZFS requires an install-time user password; --provision is only for Btrfs" >&2
+  exit 1
+fi
 
 if [[ -z $SYNC_DIR && -f ${OMARCHY_PATH:-}/test/acceptance ]]; then
   SYNC_DIR="$OMARCHY_PATH"
@@ -91,6 +107,7 @@ OVMF_VARS_TEMPLATE="/usr/share/edk2/x64/OVMF_VARS.4m.fd"
 BASE_NAME="$(basename "$ISO" .iso)"
 $ENCRYPT && BASE_NAME+="-encrypted"
 $PROVISION && BASE_NAME+="-provision"
+[[ $FILESYSTEM == "zfs" ]] && BASE_NAME+="-zfs"
 BASE_DIR="$REPO_DIR/test-runs/$BASE_NAME"
 RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%d-%H%M%S)"
 BASE_DISK="$BASE_DIR/base.qcow2"
@@ -685,23 +702,30 @@ drive_configurator() {
   capture_console "success-installer-10-install-disk"
   press ret # the single virtio disk
 
+  wait_for_screen "root filesystem" 60
+  capture_console "success-installer-11-root-filesystem"
+  if [[ $FILESYSTEM == "zfs" ]]; then
+    press down
+  fi
+  press ret
+
   wait_for_screen "installation mode\|recovery possible" 60
   if ocr_screen | grep -qi "installation mode"; then
-    capture_console "success-installer-11-install-mode"
+    capture_console "success-installer-12-install-mode"
     press ret # "Full disk install" is preselected
   fi
 
   wait_for_screen "recovery possible" 60
-  capture_console "success-installer-12-disk-warning-encrypted"
-  if ! $ENCRYPT; then
+  capture_console "success-installer-13-disk-warning"
+  if [[ $FILESYSTEM == "btrfs" ]] && ! $ENCRYPT; then
     press ctrl-c # toggles the confirm to the unencrypted flow
     wait_for_screen "without encryption" 30
-    capture_console "success-installer-13-disk-warning-unencrypted"
+    capture_console "success-installer-14-disk-warning-unencrypted"
   fi
   press ret
 
   sleep 2
-  capture_console "success-installer-14-install-started"
+  capture_console "success-installer-15-install-started"
 }
 
 # The deferred-provisioning first boot runs the user form on tty1 (omarchy-provision-owner) before
@@ -934,6 +958,21 @@ establish_session() {
       fi
     done
     # Encrypted installs autologin once the disk is unlocked
+  elif [[ $FILESYSTEM == "zfs" ]]; then
+    local waited=0
+    sleep 10
+    capture_console "success-session-01-zfs-login"
+    until ssh_guest true 2>/dev/null; do
+      type_text "$GUEST_PASSWORD"
+      press ret
+      sleep 10
+      ((waited += 11))
+      if ((waited >= BOOT_TIMEOUT)); then
+        capture_console "failure-session-zfs-login-timeout"
+        echo "Timed out unlocking the ZFS home through SDDM" >&2
+        return 1
+      fi
+    done
   else
     wait_for_ssh "$BOOT_TIMEOUT" "failure-session-ssh-timeout"
     sleep 5
@@ -941,7 +980,7 @@ establish_session() {
 
   local waited=0
   until session_started; do
-    if ! $ENCRYPT; then
+    if ! $ENCRYPT && [[ $FILESYSTEM != "zfs" ]]; then
       # SDDM remembers the user and focuses the password field
       if ((waited == 0)); then
         capture_console "success-session-01-login"
@@ -963,6 +1002,45 @@ establish_session() {
   done
 
   capture_console "success-session-03-desktop"
+}
+
+verify_zfs_install() {
+  [[ $FILESYSTEM == "zfs" ]] || return 0
+  log "Verifying ZFS storage, boot, PAM, and disk-backed temporary directories"
+  ssh_guest "echo '$GUEST_PASSWORD' | sudo -S bash -euo pipefail -c '
+    [[ \$(findmnt -n -o FSTYPE /) == zfs ]]
+    [[ \$(findmnt -n -o SOURCE /) == zroot/ROOT/default ]]
+    [[ \$(findmnt -n -o SOURCE /home/$GUEST_USER) == zroot/data/home/$GUEST_USER ]]
+    [[ \$(findmnt -n -o SOURCE /tmp) == zroot/data/tmp ]]
+    [[ \$(findmnt -n -o FSTYPE /tmp) == zfs ]]
+    [[ \$(findmnt -n -o SOURCE /var/tmp) == zroot/var/tmp ]]
+    [[ \$(findmnt -n -o FSTYPE /var/tmp) == zfs ]]
+    zpool status -x zroot | grep -Fq \"pool '\''zroot'\'' is healthy\"
+    [[ \$(zpool get -H -o value bootfs zroot) == zroot/ROOT/default ]]
+    [[ \$(zfs get -H -o value encryption zroot/data/home/$GUEST_USER) == aes-256-gcm ]]
+    [[ \$(zfs get -H -o value keyformat zroot/data/home/$GUEST_USER) == passphrase ]]
+    [[ \$(zfs get -H -o value keylocation zroot/data/home/$GUEST_USER) == prompt ]]
+    [[ \$(zfs get -H -o value keystatus zroot/data/home/$GUEST_USER) == available ]]
+    test -s /etc/hostid
+    test -s /etc/zfs/zpool.cache
+    test -s /usr/lib/security/pam_zfs_key.so
+    test -x /usr/local/lib/omarchy/zfs-pam-unlock-home
+    grep -Eq \"root=ZFS=zroot/ROOT/default.*zfs_boot_only=1\" /boot/limine.conf
+    grep -Eq \"HOOKS=.*block zfs filesystems\" /etc/mkinitcpio.conf.d/omarchy_hooks.conf
+    ! grep -Eq \"fsck|btrfs-overlayfs\" /etc/mkinitcpio.conf.d/omarchy_hooks.conf
+    grep -Fq /etc/hostid /etc/mkinitcpio.conf.d/zfs_hostid.conf
+    grep -q \"^auth.*include.*zfs-key\" /etc/pam.d/system-login
+    grep -q \"^session.*include.*zfs-key\" /etc/pam.d/system-login
+    grep -q \"^password.*include.*zfs-key\" /etc/pam.d/system-auth
+    test -L /etc/systemd/system/tmp.mount
+    [[ \$(readlink /etc/systemd/system/tmp.mount) == /dev/null ]]
+    test ! -e /etc/sddm.conf.d/autologin.conf
+    test ! -e /etc/mkinitcpio.conf.d/omarchy_resume.conf
+    grep -q \"^\\[archzfs\\]$\" /etc/pacman.conf
+    systemctl is-enabled zfs-import-cache.service zfs-import.target zfs-mount.service zfs.target >/dev/null
+    ! systemctl is-enabled limine-snapper-sync.service >/dev/null 2>&1
+    pacman -Q zfs-utils zfs-dkms dkms >/dev/null
+  '"
 }
 
 # -------------------------------------------------------------------- phases
@@ -989,6 +1067,7 @@ install_phase() {
     unlock_luks
   fi
   bootstrap_ssh
+  verify_zfs_install
 
   # SSH can come up (console bootstrap logs in on a spare TTY) while
   # omarchy-provision-owner is still finalizing the user and re-keying LUKS. Saving
@@ -1073,13 +1152,19 @@ acceptance_phase() {
   start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
 
   establish_session
+  verify_zfs_install
   sync_omarchy
 
   local status=0
   shortcut_smoke_phase || status=1
 
   log "Running acceptance suite"
-  ssh_guest "OMARCHY_PATH=$guest_omarchy_path OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance bash .local/share/omarchy/test/acceptance" || status=$?
+  ssh_guest "OMARCHY_PATH=$guest_omarchy_path OMARCHY_EXPECTED_FILESYSTEM=$FILESYSTEM OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance bash .local/share/omarchy/test/acceptance" || status=$?
+
+  if [[ $FILESYSTEM == "zfs" ]] && grep -Fq "no pools available to import" "$RUN_DIR/serial.log"; then
+    echo "ZFS boot attempted a broad late pool import" >&2
+    status=1
+  fi
 
   log "Collecting artifacts into $RUN_DIR"
   ssh_guest "tar -C /tmp -cf - omarchy-acceptance 2>/dev/null" | tar -C "$RUN_DIR" -xf - || true

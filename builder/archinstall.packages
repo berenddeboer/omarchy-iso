@@ -2,10 +2,13 @@ alsa-firmware
 amd-ucode
 base
 base-devel
+dkms
 efibootmgr
 intel-ucode
 linux-firmware
 linux
+linux-headers
+linux-t2-headers
 limine
 omarchy-keyring
 openssh
@@ -13,3 +16,5 @@ pipewire
 snapper
 sof-firmware
 tailscale
+zfs-dkms
+zfs-utils

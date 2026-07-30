@@ -435,6 +435,14 @@ disk_abort_hook() {
   abort "$1"
 }
 
+kernel_headers_for() {
+  case "$1" in
+    linux) echo "linux-headers" ;;
+    linux-t2) echo "linux-t2-headers" ;;
+    *) echo "$1-headers" ;;
+  esac
+}
+
 # Save the configurator answers the installer consumes: git identity and
 # encryption choice as plain files, account details as archinstall credentials.
 # Deferred-provisioning installs defer the user to first boot: no credentials, and on encrypted
@@ -937,13 +945,27 @@ install_mode_form() {
 
   # The free-space/protected path registers an EFI boot entry and is UEFI-only.
   # Full-disk installs still support BIOS through the orchestrator's BIOS branch.
-  if [[ -d /sys/firmware/efi ]] && ! $full_disk_only; then
+  if [[ $root_filesystem == "btrfs" && -d /sys/firmware/efi ]] && ! $full_disk_only; then
     choices+=("Free space install (alongside existing data)")
   fi
   choices+=("Choose a different disk")
 
   step "Let's select how to install Omarchy..."
   install_mode=$(gum choose --header "Select installation mode on $disk" "${choices[@]}") || abort
+}
+
+root_filesystem_form() {
+  local choices=("Btrfs (encrypted root and snapshots)")
+  if [[ -d /sys/firmware/efi && -f /usr/share/omarchy-iso/zfs-capable ]]; then
+    choices+=("ZFS (encrypted home, experimental)")
+  fi
+
+  step "Let's select the root filesystem..."
+  filesystem_choice=$(gum choose --header "Select root filesystem" "${choices[@]}") || abort
+  case "$filesystem_choice" in
+    ZFS*) root_filesystem="zfs" ;;
+    *) root_filesystem="btrfs" ;;
+  esac
 }
 
 confirm_disk_overwrite() {
@@ -955,7 +977,11 @@ confirm_disk_overwrite() {
     echo
     say "Everything will be overwritten. There is no recovery possible."
 
-    if [[ $mode == "encrypted" ]]; then
+    if [[ $root_filesystem == "zfs" ]]; then
+      say "Your home directory will use native ZFS encryption."
+      say --foreground 8 "System files and logs are not encrypted. /tmp stays on disk, not in RAM."
+      affirmative="Yes, install on ZFS"
+    elif [[ $mode == "encrypted" ]]; then
       say --foreground 8 "Press Ctrl+C for unencrypted install."
       affirmative="Yes, install"
     else
@@ -968,14 +994,20 @@ confirm_disk_overwrite() {
 
     case $confirm_status in
       0)
-        [[ $mode == "encrypted" ]] && encrypt_installation=true || encrypt_installation=false
+        if [[ $root_filesystem == "zfs" || $mode == "encrypted" ]]; then
+          encrypt_installation=true
+        else
+          encrypt_installation=false
+        fi
         return 0
         ;;
       1)
         return 1
         ;;
       130)
-        [[ $mode == "encrypted" ]] && mode="unencrypted" || mode="encrypted"
+        if [[ $root_filesystem != "zfs" ]]; then
+          [[ $mode == "encrypted" ]] && mode="unencrypted" || mode="encrypted"
+        fi
         ;;
       *)
         abort
@@ -1025,6 +1057,7 @@ select_installation() {
         ;;
       "Choose a different disk")
         disk_form
+        root_filesystem_form
         ;;
     esac
   done
@@ -1034,6 +1067,7 @@ select_installation() {
 
 defer_provisioning=false
 install_target="full_disk"
+root_filesystem="btrfs"
 
 # Let the live VT reach its settled width before the first screen so the logo
 # isn't measured against the transient 80-column boot console.
@@ -1075,6 +1109,7 @@ if $defer_provisioning; then
   install_target="full_disk"
 else
   disk_form
+  root_filesystem_form
   select_installation
 fi
 
@@ -1084,6 +1119,92 @@ write_user_files
 
 if [[ $install_target == "free_space" ]]; then
   run_partition_execute "$@"
+  if [[ ${1:-} == "dry" ]]; then
+    print_dry_run_files
+  fi
+  exit 0
+fi
+
+kernel_choice=$(detect_kernel)
+
+if [[ $root_filesystem == "zfs" ]]; then
+  kernel_headers=$(kernel_headers_for "$kernel_choice")
+  cat <<-_EOF_ >user_configuration.json
+{
+    "app_config": null,
+    "archinstall-language": "English",
+    "auth_config": {},
+    "audio_config": { "audio": "pipewire" },
+    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "custom_commands": [],
+    "omarchy_install": {
+        "mode": "full_disk",
+        "target_mount": "/mnt",
+        "boot": {
+            "esp_mount": "/boot",
+            "esp_path": "/EFI/limine",
+            "efi_binary": "limine_x64.efi",
+            "enable_fallback": true
+        },
+        "storage": {
+            "filesystem": "zfs",
+            "wipe": true,
+            "disk": "$disk",
+            "pool": "zroot",
+            "root_dataset": "zroot/ROOT/default",
+            "home_prefix": "zroot/data/home",
+            "home_dataset": "zroot/data/home/$username",
+            "home_encrypted": true,
+            "kernel": "$kernel_choice"
+        }
+    },
+    "disk_config": {
+        "config_type": "pre_mounted_config",
+        "mountpoint": "/mnt"
+    },
+    "hostname": "$hostname",
+    "kernels": [ "$kernel_choice" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "parallel_downloads": 8,
+    "script": null,
+    "services": [],
+    "swap": false,
+    "timezone": "$timezone",
+    "locale_config": {
+        "kb_layout": "$keyboard",
+        "sys_enc": "UTF-8",
+        "sys_lang": "en_US.UTF-8"
+    },
+    "mirror_config": {
+        "custom_repositories": [],
+        "custom_servers": [
+            {"url": "https://mirror.omarchy.org/\$repo/os/\$arch"},
+            {"url": "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"},
+            {"url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"}
+        ],
+        "mirror_regions": {},
+        "optional_repositories": []
+    },
+    "packages": [
+        "base-devel",
+        "dkms",
+        "$kernel_headers",
+        "zfs-utils",
+        "zfs-dkms",
+        "git",
+        "omarchy-keyring",
+        "$OMARCHY_SETTINGS_PACKAGE",
+        "$OMARCHY_RUNTIME_PACKAGE"
+    ],
+    "profile_config": {
+        "gfx_driver": null,
+        "greeter": null,
+        "profile": {}
+    },
+    "version": "3.0.9"
+}
+_EOF_
 
   if [[ ${1:-} == "dry" ]]; then
     print_dry_run_files
@@ -1103,8 +1224,6 @@ boot_partition_size=$((2 * gib))
 
 main_partition_start=$((boot_partition_size + boot_partition_start))
 main_partition_size=$((disk_size_in_mib - main_partition_start - gpt_backup_reserve))
-
-kernel_choice=$(detect_kernel)
 
 if [[ $encrypt_installation == true ]]; then
   # Deferred-provisioning installs carry no password: the orchestrator generates a throwaway
