@@ -172,6 +172,10 @@ pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571
 pacman --config "$online_pacman_conf" --noconfirm -Sy omarchy-keyring
 pacman-key --populate omarchy
 
+ARCHZFS_KEY=3A9917BF0DED5C13F69AC68FABEC0A1208037BE9
+pacman-key --recv-keys "$ARCHZFS_KEY"
+pacman-key --lsign-key "$ARCHZFS_KEY"
+
 # Put OPR first in the container too so makepkg resolves the same overrides
 # as the online installer configuration.
 if ! grep -q '^\[omarchy\]' /etc/pacman.conf; then
@@ -322,6 +326,12 @@ fi
 # trees and drop them in the offline mirror. Otherwise pacman -Syw below
 # downloads the published versions from the omarchy network mirror.
 if [[ -d /omarchy-source && -d /omarchy-pkgs ]]; then
+  if [[ ! -f /omarchy-source/install/config/zfs.sh ]]; then
+    echo "ERROR: local Omarchy source does not provide Quattro-on-ZFS setup" >&2
+    exit 1
+  fi
+  touch "$build_cache_dir/airootfs/usr/share/omarchy-iso/zfs-capable"
+  pacman-key --export "$ARCHZFS_KEY" >"$build_cache_dir/airootfs/usr/share/omarchy-iso/archzfs.gpg"
   bash /builder/build-omarchy-packages.sh "$offline_mirror_dir"
   LOCAL_OMARCHY_BUILD=1
   # A rebuild of the same revision produces the same filename with different
@@ -361,7 +371,7 @@ if [[ $OMARCHY_ARCH == aarch64 ]]; then
   arch_packages=("$OMARCHY_KERNEL" archlinuxarm-keyring git gum jq openssl openssh pciutils plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted systemd-ukify linux-firmware-qcom qcom-firmware-extract python)
 else
   # linux-t2 is the live kernel on a Mac (configs/grub/grub.cfg).
-  arch_packages=("$OMARCHY_KERNEL" linux-t2 git gum jq openssl plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
+  arch_packages=("$OMARCHY_KERNEL" linux-t2 linux-t2-headers gptfdisk dkms zfs-utils zfs-dkms git gum jq openssl plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
 fi
 live_packages_file="$build_cache_dir/packages.$OMARCHY_ARCH"
 printf '%s\n' "${arch_packages[@]}" >> "$live_packages_file"
