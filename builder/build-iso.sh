@@ -40,6 +40,10 @@ pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571
 pacman --config /configs/pacman-online-${OMARCHY_MIRROR}.conf --noconfirm -Sy omarchy-keyring
 pacman-key --populate omarchy
 
+ARCHZFS_KEY=3A9917BF0DED5C13F69AC68FABEC0A1208037BE9
+pacman-key --recv-keys "$ARCHZFS_KEY"
+pacman-key --lsign-key "$ARCHZFS_KEY"
+
 # Append the [omarchy] repo to the container's /etc/pacman.conf so subsequent
 # tools (notably makepkg in build-omarchy-packages.sh) can resolve omarchy-
 # only build deps like limine-snapper-sync and limine-mkinitcpio-hook.
@@ -63,6 +67,7 @@ rm -rf "$build_cache_dir/airootfs/etc/xdg/reflector"
 
 # Bring in our archiso profile additions.
 cp -r /configs/* "$build_cache_dir/"
+rm -f "$build_cache_dir/airootfs/etc/mkinitcpio.d/linux.preset"
 mkdir -p "$build_cache_dir/airootfs/usr/share/omarchy-iso"
 echo "$OMARCHY_MIRROR" > "$build_cache_dir/airootfs/root/omarchy_mirror"
 echo "$OMARCHY_ISO_REF" > "$build_cache_dir/airootfs/root/omarchy_iso_ref"
@@ -99,6 +104,12 @@ fi
 # trees and drop them in the offline mirror. Otherwise pacman -Syw below
 # downloads the published versions from the omarchy network mirror.
 if [[ -d /omarchy-source && -d /omarchy-pkgs ]]; then
+  if [[ ! -f /omarchy-source/install/config/zfs.sh ]]; then
+    echo "ERROR: local Omarchy source does not provide Quattro-on-ZFS setup" >&2
+    exit 1
+  fi
+  touch "$build_cache_dir/airootfs/usr/share/omarchy-iso/zfs-capable"
+  pacman-key --export "$ARCHZFS_KEY" >"$build_cache_dir/airootfs/usr/share/omarchy-iso/archzfs.gpg"
   bash /builder/build-omarchy-packages.sh "$offline_mirror_dir"
   LOCAL_OMARCHY_BUILD=1
 fi
@@ -117,7 +128,7 @@ cp "/tmp/$NODE_FILENAME" "$build_cache_dir/airootfs/opt/packages/"
 # The selected omarchy-settings package is needed here so its post_install hook
 # drops Omarchy's plymouthd.conf into /etc/plymouth before mkarchiso builds the
 # live initramfs.
-arch_packages=(linux-t2 git gum jq openssl plymouth python-terminaltexteffects tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
+arch_packages=(linux-t2 linux-t2-headers git gum jq openssl plymouth python-terminaltexteffects tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted gptfdisk dkms zfs-utils zfs-dkms)
 printf '%s\n' "${arch_packages[@]}" >> "$build_cache_dir/packages.x86_64"
 
 # The live ISO boots linux-t2 (see airootfs/etc/mkinitcpio.d/linux-t2.preset), so

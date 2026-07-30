@@ -86,6 +86,26 @@ class InstallContext:
     def is_protected(self) -> bool:
         return self.mode == "protected"
 
+    @property
+    def storage(self) -> dict[str, Any]:
+        return self.omarchy_install.get("storage") or {}
+
+    @property
+    def filesystem(self) -> str:
+        return self.storage.get("filesystem") or "btrfs"
+
+    @property
+    def is_zfs(self) -> bool:
+        return self.filesystem == "zfs"
+
+    @property
+    def has_luks_root(self) -> bool:
+        return bool(self.encrypt and not self.is_zfs)
+
+    @property
+    def boot_requires_passphrase(self) -> bool:
+        return self.has_luks_root
+
 
 def _default_omarchy_install(user_configuration: dict) -> dict[str, Any]:
     disk_config = user_configuration.get("disk_config", {})

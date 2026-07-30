@@ -67,7 +67,7 @@ def main() -> int:
     from .phases_impl import (
         boost_cpu_governor,
         cleanup_bind_mounts,
-        cleanup_protected_state,
+        cleanup_storage_state,
         cleanup_target_hook_masks,
         restore_cpu_governors,
     )
@@ -92,8 +92,7 @@ def main() -> int:
         restore_cpu_governors(governors)
         cleanup_bind_mounts(ctx)
         cleanup_target_hook_masks(ctx)
-        if not success:
-            cleanup_protected_state(ctx)
+        cleanup_storage_state(ctx, success=success)
 
 
 if __name__ == "__main__":
