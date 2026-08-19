@@ -124,6 +124,21 @@ The first scenario is `factory-reset`: it proves `omarchy-system-factory-reset` 
 
 Artifacts — screenshots, the fixtured/staged/final `limine.conf`, the reset typescript, and the factory-reset log — land under `test-runs/<iso>-integration/runs/<timestamp>-<scenario>/`, and `--no-preview` skips the `imv` review just like the acceptance harness.
 
+### Testing an Omarchy 3 ZFS upgrade
+
+Keep the powered-off Omarchy 3 fixture outside Git and run the migration preflight through a disposable overlay:
+
+```bash
+./bin/omarchy-iso-test-upgrade-preflight \
+  --base test-runs/upgrade-omarchy3-zfs/fixture/base.qcow2 \
+  --ovmf-vars test-runs/upgrade-omarchy3-zfs/fixture/OVMF_VARS.4m.fd \
+  --ssh-key test-runs/upgrade-omarchy3-zfs/fixture/id_ed25519 \
+  --home-password test-runs/upgrade-omarchy3-zfs/fixture/home-password \
+  --user omarchy --omarchy ../omarchy
+```
+
+The fixture must have SSH enabled for an unencrypted maintenance account (root by default); the encrypted Omarchy user's own `authorized_keys` is unavailable before PAM unlocks the home. The runner checksums the fixture disk and OVMF state, boots only a qcow2 overlay and copied OVMF state, runs the read-only ZFS migration checker, and verifies the original fixture is unchanged. It intentionally does not run the migration until the package, PAM, rollback, and dual-UKI phases are implemented and covered by interruption tests.
+
 ## Signing the ISO
 
 Run `./bin/omarchy-iso-sign [release/omarchy.iso]`. The signing key is retrieved from the shared Omarchy vault with the 1Password CLI.

@@ -1,0 +1,68 @@
+#!/bin/bash
+
+set -euo pipefail
+
+REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+GOLD_DIR="$REPO_DIR/test-runs/omarchy3-zfs-gold"
+GOLD_DISK="$GOLD_DIR/omarchy3-zfs.qcow2"
+GOLD_OVMF="$GOLD_DIR/OVMF_VARS.4m.fd"
+ISO="$REPO_DIR/test-runs/omarchy3-zfs-iso/omarchy-3-zfs.iso"
+BOOT=0
+NAME=""
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-iso-clone-omarchy3-zfs [--boot] [NAME]
+
+Create a disposable overlay of the Omarchy 3 ZFS gold master.
+Never boots or writes the gold disk. Use this for every upgrade test.
+
+  --boot   Start the copy after creating it
+  NAME     Copy directory name (default: timestamp)
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --boot) BOOT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *) NAME="$1"; shift ;;
+  esac
+done
+
+[[ -f $GOLD_DISK && -f $GOLD_OVMF ]] || {
+  printf 'Gold master not frozen yet. Power off the installed VM first.\n' >&2
+  printf 'Expected:\n  %s\n  %s\n' "$GOLD_DISK" "$GOLD_OVMF" >&2
+  exit 1
+}
+
+if [[ -z $NAME ]]; then
+  NAME=$(date -u +%Y%m%dT%H%M%SZ)
+fi
+
+COPY_DIR="$GOLD_DIR/copies/$NAME"
+if [[ -e $COPY_DIR ]]; then
+  printf 'Copy already exists: %s\n' "$COPY_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$COPY_DIR"
+qemu-img create -f qcow2 -F qcow2 -b "$GOLD_DISK" "$COPY_DIR/overlay.qcow2" >/dev/null
+cp --reflink=auto "$GOLD_OVMF" "$COPY_DIR/OVMF_VARS.4m.fd"
+cat >"$COPY_DIR/README.txt" <<EOF
+Disposable overlay of the Omarchy 3 ZFS gold master.
+Upgrade this copy. Never point QEMU at $GOLD_DISK.
+EOF
+
+printf 'Copy: %s\n' "$COPY_DIR"
+printf 'Boot:\n  %s/bin/omarchy-iso-boot --reuse --disk %s/overlay.qcow2 --ovmf-vars %s/OVMF_VARS.4m.fd %s\n' \
+  "$REPO_DIR" "$COPY_DIR" "$COPY_DIR" "$ISO"
+
+if ((BOOT)); then
+  exec "$REPO_DIR/bin/omarchy-iso-boot" \
+    --reuse \
+    --disk "$COPY_DIR/overlay.qcow2" \
+    --ovmf-vars "$COPY_DIR/OVMF_VARS.4m.fd" \
+    "$ISO"
+fi
