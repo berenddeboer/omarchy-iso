@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# Boot an immutable Omarchy 3 ZFS fixture through a disposable qcow2 overlay
+# and run the Quattro migration preflight. The base disk and base OVMF state are
+# checksummed before and after the run and are never attached to QEMU writable.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-iso-test-upgrade-preflight --base DISK --ovmf-vars FILE --ssh-key FILE [options]
+
+Options:
+  --base DISK          Powered-off Omarchy 3 ZFS qcow2 fixture
+  --ovmf-vars FILE     OVMF variable store paired with the fixture
+  --ssh-key FILE       Private key authorized in the fixture
+  --home-password FILE Load and mount the encrypted test home from this file
+  --user USER          Fixture user (default: omarchy)
+  --ssh-user USER      Unencrypted maintenance account (default: root)
+  --omarchy DIR        Quattro-on-ZFS checkout (default: ../omarchy)
+  --port PORT          Host SSH port (default: 2232)
+  --memory MB          VM memory (default: 8192)
+  --run-dir DIR        Artifact directory (default: test-runs/upgrade-preflight/<timestamp>)
+  --keep-running       Leave the disposable VM running
+  -h, --help           Show this help
+
+The fixture must have SSH enabled for an unencrypted maintenance account. This
+command performs no upgrade; it establishes the mandatory cloned-VM baseline
+before package, PAM, or UKI migration work is enabled.
+USAGE
+}
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(dirname "$SCRIPT_DIR")
+BASE_DISK=""
+BASE_OVMF=""
+SSH_KEY=""
+HOME_PASSWORD_FILE=""
+GUEST_USER=omarchy
+SSH_USER=root
+OMARCHY_DIR="$REPO_DIR/../omarchy"
+SSH_PORT=2232
+MEMORY=8192
+RUN_DIR=""
+KEEP_RUNNING=0
+
+while (($#)); do
+  case "$1" in
+    --base) BASE_DISK="$2"; shift 2 ;;
+    --ovmf-vars) BASE_OVMF="$2"; shift 2 ;;
+    --ssh-key) SSH_KEY="$2"; shift 2 ;;
+    --home-password) HOME_PASSWORD_FILE="$2"; shift 2 ;;
+    --user) GUEST_USER="$2"; shift 2 ;;
+    --ssh-user) SSH_USER="$2"; shift 2 ;;
+    --omarchy) OMARCHY_DIR="$2"; shift 2 ;;
+    --port) SSH_PORT="$2"; shift 2 ;;
+    --memory) MEMORY="$2"; shift 2 ;;
+    --run-dir) RUN_DIR="$2"; shift 2 ;;
+    --keep-running) KEEP_RUNNING=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $GUEST_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || { printf 'Invalid fixture user: %s\n' "$GUEST_USER" >&2; exit 2; }
+[[ $SSH_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || { printf 'Invalid SSH user: %s\n' "$SSH_USER" >&2; exit 2; }
+
+for value in BASE_DISK BASE_OVMF SSH_KEY; do
+  [[ -n ${!value} ]] || { printf '%s is required\n' "$value" >&2; usage >&2; exit 2; }
+done
+[[ -f $BASE_DISK ]] || { printf 'Fixture disk not found: %s\n' "$BASE_DISK" >&2; exit 1; }
+[[ -f $BASE_OVMF ]] || { printf 'Fixture OVMF vars not found: %s\n' "$BASE_OVMF" >&2; exit 1; }
+[[ -f $SSH_KEY ]] || { printf 'SSH key not found: %s\n' "$SSH_KEY" >&2; exit 1; }
+CHECKER="$OMARCHY_DIR/bin/omarchy-upgrade-to-quattro-zfs-check"
+[[ -x $CHECKER ]] || { printf 'Preflight checker not executable: %s\n' "$CHECKER" >&2; exit 1; }
+
+for command in qemu-img qemu-system-x86_64 ssh scp sha256sum; do
+  command -v "$command" >/dev/null || { printf 'Required command is missing: %s\n' "$command" >&2; exit 1; }
+done
+
+BASE_DISK=$(realpath "$BASE_DISK")
+BASE_OVMF=$(realpath "$BASE_OVMF")
+SSH_KEY=$(realpath "$SSH_KEY")
+if [[ -n $HOME_PASSWORD_FILE ]]; then
+  [[ -f $HOME_PASSWORD_FILE ]] || { printf 'Home password file not found: %s\n' "$HOME_PASSWORD_FILE" >&2; exit 1; }
+  HOME_PASSWORD_FILE=$(realpath "$HOME_PASSWORD_FILE")
+fi
+if [[ -z $RUN_DIR ]]; then
+  RUN_DIR="$REPO_DIR/test-runs/upgrade-preflight/$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+mkdir -p "$RUN_DIR"
+RUN_DIR=$(realpath "$RUN_DIR")
+OVERLAY="$RUN_DIR/overlay.qcow2"
+RUN_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
+PIDFILE="$RUN_DIR/qemu.pid"
+SERIAL_LOG="$RUN_DIR/serial.log"
+
+fixture_checksum() {
+  sha256sum "$BASE_DISK" "$BASE_OVMF"
+}
+
+fixture_checksum >"$RUN_DIR/fixture-before.sha256"
+qemu-img check "$BASE_DISK" | tee "$RUN_DIR/qemu-img-check.txt"
+qemu-img create -f qcow2 -F qcow2 -b "$BASE_DISK" "$OVERLAY"
+cp --reflink=auto "$BASE_OVMF" "$RUN_OVMF"
+
+ssh_args=(
+  -i "$SSH_KEY" -p "$SSH_PORT"
+  -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ConnectTimeout=5
+)
+scp_args=(
+  -i "$SSH_KEY" -P "$SSH_PORT"
+  -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ConnectTimeout=5
+)
+
+stop_vm() {
+  if [[ -f $PIDFILE ]] && kill -0 "$(<"$PIDFILE")" 2>/dev/null; then
+    ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" 'sudo systemctl poweroff' >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+      kill -0 "$(<"$PIDFILE")" 2>/dev/null || return 0
+      sleep 1
+    done
+    kill "$(<"$PIDFILE")" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  status=$?
+  ((KEEP_RUNNING)) || stop_vm
+  fixture_checksum >"$RUN_DIR/fixture-after.sha256"
+  if ! cmp -s "$RUN_DIR/fixture-before.sha256" "$RUN_DIR/fixture-after.sha256"; then
+    printf 'Fixture disk or OVMF state changed; refusing success.\n' >&2
+    status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+qemu-system-x86_64 \
+  -name omarchy3-zfs-upgrade-preflight \
+  -cpu host -enable-kvm -machine q35,accel=kvm \
+  -smp "$(($(nproc) < 8 ? $(nproc) : 8))" -m "$MEMORY" \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+  -drive if=pflash,format=raw,file="$RUN_OVMF" \
+  -drive file="$OVERLAY",format=qcow2,if=none,id=drive0 \
+  -device virtio-blk-pci,drive=drive0,serial=omarchy-iso-vm-test,bootindex=1 \
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
+  -device virtio-net-pci,netdev=net0 \
+  -display none -serial "file:$SERIAL_LOG" \
+  >"$RUN_DIR/qemu.log" 2>&1 &
+printf '%s\n' "$!" >"$PIDFILE"
+
+printf 'Waiting for SSH on port %s...\n' "$SSH_PORT"
+for _ in {1..120}; do
+  if ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" true >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" true >/dev/null 2>&1 || { printf 'Guest SSH did not become ready.\n' >&2; exit 1; }
+
+if [[ -n $HOME_PASSWORD_FILE ]]; then
+  printf -v remote_unlock "zfs load-key %q 2>/dev/null || true; zfs mount %q" \
+    "zroot/data/home/$GUEST_USER" "zroot/data/home/$GUEST_USER"
+  # shellcheck disable=SC2029 # remote_unlock is deliberately evaluated by the guest shell.
+  ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" \
+    "$remote_unlock" \
+    <"$HOME_PASSWORD_FILE"
+fi
+
+scp "${scp_args[@]}" "$CHECKER" "$SSH_USER@127.0.0.1:/tmp/omarchy-upgrade-to-quattro-zfs-check" >/dev/null
+printf -v remote_check 'chmod +x /tmp/omarchy-upgrade-to-quattro-zfs-check && sudo /tmp/omarchy-upgrade-to-quattro-zfs-check --user %q --output /var/log/omarchy-upgrade-preflight' "$GUEST_USER"
+# shellcheck disable=SC2029 # remote_check is deliberately evaluated by the guest shell.
+ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" \
+  "$remote_check" \
+  | tee "$RUN_DIR/preflight.log"
+
+scp "${scp_args[@]}" -r "$SSH_USER@127.0.0.1:/var/log/omarchy-upgrade-preflight" "$RUN_DIR/inventory" >/dev/null 2>&1 || \
+  {
+    printf -v remote_archive 'sudo tar -C /var/log -cf /tmp/omarchy-upgrade-preflight.tar omarchy-upgrade-preflight && sudo chown %q /tmp/omarchy-upgrade-preflight.tar' "$SSH_USER"
+    # shellcheck disable=SC2029 # remote_archive is deliberately evaluated by the guest shell.
+    ssh "${ssh_args[@]}" "$SSH_USER@127.0.0.1" "$remote_archive"
+  }
+[[ -d $RUN_DIR/inventory ]] || scp "${scp_args[@]}" "$SSH_USER@127.0.0.1:/tmp/omarchy-upgrade-preflight.tar" "$RUN_DIR/" >/dev/null
+
+printf 'Preflight passed in the disposable VM. Artifacts: %s\n' "$RUN_DIR"
