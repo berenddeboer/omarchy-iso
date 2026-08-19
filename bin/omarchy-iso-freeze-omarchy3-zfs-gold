@@ -1,0 +1,82 @@
+#!/bin/bash
+
+set -euo pipefail
+
+REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SRC_DISK="$REPO_DIR/test-runs/omarchy3-zfs-iso/boot.qcow2"
+SRC_OVMF="$REPO_DIR/test-runs/omarchy3-zfs-iso/OVMF_VARS.4m.fd"
+GOLD_DIR="$REPO_DIR/test-runs/omarchy3-zfs-gold"
+GOLD_DISK="$GOLD_DIR/omarchy3-zfs.qcow2"
+GOLD_OVMF="$GOLD_DIR/OVMF_VARS.4m.fd"
+WAIT=0
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-iso-freeze-omarchy3-zfs-gold [--wait]
+
+Copy the installed Omarchy 3 ZFS disk to a read-only gold master.
+Refuses to copy while QEMU still has the source disk open.
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --wait) WAIT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+disk_locked() {
+  ! qemu-img info "$SRC_DISK" >/dev/null 2>&1
+}
+
+if ((WAIT)); then
+  printf 'Waiting for QEMU to release %s\n' "$SRC_DISK"
+  while disk_locked; do
+    sleep 5
+  done
+elif disk_locked; then
+  printf 'Source disk is still in use. Power off the VM, then rerun.\n' >&2
+  exit 1
+fi
+
+[[ -f $SRC_DISK && -f $SRC_OVMF ]] || {
+  printf 'Installed disk not found.\n' >&2
+  exit 1
+}
+
+if [[ -e $GOLD_DISK ]]; then
+  printf 'Gold master already exists: %s\n' "$GOLD_DISK" >&2
+  exit 1
+fi
+
+mkdir -p "$GOLD_DIR/copies"
+qemu-img check "$SRC_DISK"
+cp --reflink=auto "$SRC_DISK" "$GOLD_DISK"
+cp --reflink=auto "$SRC_OVMF" "$GOLD_OVMF"
+chmod a-w "$GOLD_DISK" "$GOLD_OVMF" "$SRC_DISK" "$SRC_OVMF"
+if command -v chattr >/dev/null; then
+  chattr +i "$GOLD_DISK" "$GOLD_OVMF" || true
+fi
+sha256sum "$GOLD_DISK" "$GOLD_OVMF" >"$GOLD_DIR/omarchy3-zfs.sha256"
+cat >"$GOLD_DIR/MANIFEST.txt" <<EOF
+Omarchy 3 ZFS gold master
+=========================
+
+This installed disk is the immutable Omarchy 3 ZFS starting point.
+It must stay on Omarchy 3. Never boot it for an upgrade. Never write it.
+
+Gold disk: $GOLD_DISK
+Gold OVMF: $GOLD_OVMF
+Source install: $SRC_DISK
+Frozen: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+ISO: test-runs/omarchy3-zfs-iso/omarchy-3-zfs.iso
+
+Create a disposable copy:
+  ./bin/omarchy-iso-clone-omarchy3-zfs
+  ./bin/omarchy-iso-clone-omarchy3-zfs --boot
+EOF
+
+printf 'Gold master frozen at %s\n' "$GOLD_DIR"
+cat "$GOLD_DIR/omarchy3-zfs.sha256"

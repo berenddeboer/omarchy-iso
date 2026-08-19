@@ -46,6 +46,21 @@ The harness syncs the acceptance suite from `$OMARCHY_PATH` when it is available
 
 Pass `--encrypt` to drive the encrypted install flow (including typing the LUKS passphrase at boot) instead of the unencrypted one. Pass `--no-preview` to collect the same visual artifacts without opening them in `imv` when the run finishes.
 
+### Testing an Omarchy 3 ZFS upgrade
+
+Keep the powered-off Omarchy 3 fixture outside Git and run the migration preflight through a disposable overlay:
+
+```bash
+./bin/omarchy-iso-test-upgrade-preflight \
+  --base test-runs/upgrade-omarchy3-zfs/fixture/base.qcow2 \
+  --ovmf-vars test-runs/upgrade-omarchy3-zfs/fixture/OVMF_VARS.4m.fd \
+  --ssh-key test-runs/upgrade-omarchy3-zfs/fixture/id_ed25519 \
+  --home-password test-runs/upgrade-omarchy3-zfs/fixture/home-password \
+  --user omarchy --omarchy ../omarchy
+```
+
+The fixture must have SSH enabled for an unencrypted maintenance account (root by default); the encrypted Omarchy user's own `authorized_keys` is unavailable before PAM unlocks the home. The runner checksums the fixture disk and OVMF state, boots only a qcow2 overlay and copied OVMF state, runs the read-only ZFS migration checker, and verifies the original fixture is unchanged. It intentionally does not run the migration until the package, PAM, rollback, and dual-UKI phases are implemented and covered by interruption tests.
+
 ## Signing the ISO
 
 Run `./bin/omarchy-iso-sign [release/omarchy.iso]`. The signing key is retrieved from the shared Omarchy vault with the 1Password CLI.
