@@ -251,6 +251,7 @@ ocr_screen() {
   [[ -s $shot ]] || return 0
   magick "$shot" -colorspace gray -negate -resize 150% "$prepped" 2>/dev/null || return 0
   tesseract "$prepped" - --psm 6 2>/dev/null || true
+  tesseract "$prepped" - --psm 3 2>/dev/null || true
 }
 
 # Wait until the console shows the given text. Saves the offending screen as
@@ -849,6 +850,14 @@ wait_for_install() {
   done
 }
 
+boot_limine_if_visible() {
+  if ocr_screen | grep -qi "Bootloader"; then
+    log "Limine menu is visible; booting its selected entry"
+    press ret
+    sleep 5
+  fi
+}
+
 # Encrypted boots stop at the LUKS passphrase prompt. Plymouth's prompt isn't
 # reliably OCR-able, so type the passphrase on an interval until a console
 # login becomes reachable; early keystrokes are harmlessly discarded.
@@ -858,6 +867,7 @@ unlock_luks() {
   local waited=0
   sleep 10
   capture_console "success-first-boot-01-luks-prompt"
+  boot_limine_if_visible
 
   while true; do
     type_text "$GUEST_PASSWORD"
@@ -942,6 +952,7 @@ establish_session() {
     local waited=0
     sleep 10
     capture_console "success-session-01-luks-prompt"
+    boot_limine_if_visible
     until ssh_guest true 2>/dev/null; do
       type_text "$GUEST_PASSWORD"
       if ((waited == 0)); then
@@ -1024,7 +1035,7 @@ verify_zfs_install() {
     test -s /etc/hostid
     test -s /etc/zfs/zpool.cache
     test -s /usr/lib/security/pam_zfs_key.so
-    test -x /usr/local/lib/omarchy/zfs-pam-unlock-home
+    test -x /usr/share/omarchy/install/config/zfs/zfs-pam-unlock-home
     grep -Eq \"root=ZFS=zroot/ROOT/default.*zfs_boot_only=1\" /boot/limine.conf
     grep -Eq \"HOOKS=.*block zfs filesystems\" /etc/mkinitcpio.conf.d/omarchy_hooks.conf
     ! grep -Eq \"fsck|btrfs-overlayfs\" /etc/mkinitcpio.conf.d/omarchy_hooks.conf
