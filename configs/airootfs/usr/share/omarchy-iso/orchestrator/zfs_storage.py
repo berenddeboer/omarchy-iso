@@ -226,7 +226,7 @@ def validate_target(ctx: InstallContext, limine_text: str) -> None:
         ctx.target / "etc/zfs/zpool.cache",
         ctx.target / "etc/pam.d/zfs-key",
         ctx.target / "usr/lib/security/pam_zfs_key.so",
-        ctx.target / "usr/local/lib/omarchy/zfs-pam-unlock-home",
+        ctx.target / "usr/share/omarchy/install/config/zfs/zfs-pam-unlock-home",
         ctx.target / f"home/{ctx.username}/.config/omarchy/shell.json",
     ]
     for path in required:
