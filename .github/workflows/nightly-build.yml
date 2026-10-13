@@ -12,6 +12,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ZFS must bundle its paired runtime, not the published Btrfs-only one.
+      - name: Checkout ZFS Omarchy source
+        if: github.ref_name == 'quattro-on-zfs'
+        uses: actions/checkout@v4
+        with:
+          repository: berenddeboer/omarchy
+          ref: quattro-on-zfs
+          path: .build-sources/omarchy
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout Omarchy package recipes
+        if: github.ref_name == 'quattro-on-zfs'
+        uses: actions/checkout@v4
+        with:
+          repository: omacom-io/omarchy-pkgs
+          ref: master
+          path: .build-sources/omarchy-pkgs
+          persist-credentials: false
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -19,7 +39,15 @@ jobs:
         uses: jlumbroso/free-disk-space@v1.3.1
 
       - name: Build ISO
+        if: github.ref_name != 'quattro-on-zfs'
         run: NO_BOOT_OFFER=1 ./bin/omarchy-iso-make
+
+      - name: Build ZFS ISO from paired source
+        if: github.ref_name == 'quattro-on-zfs'
+        run: >-
+          ./bin/omarchy-iso-make --no-boot-offer --debug
+          --local-source "$GITHUB_WORKSPACE/.build-sources/omarchy"
+          "$GITHUB_WORKSPACE/.build-sources/omarchy-pkgs"
 
       - name: Delete previously uploaded ISO artifact
         uses: philips-labs/action-delete-artifacts@v1.0.0
