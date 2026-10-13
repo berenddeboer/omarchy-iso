@@ -51,10 +51,43 @@ env:
   SITE: https://nightly.omarchy.org
 
 jobs:
+  zfs:
+    name: ZFS ISO from paired source
+    if: github.ref_name == 'quattro-on-zfs'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: berenddeboer/omarchy
+          ref: quattro-on-zfs
+          path: .build-sources/omarchy
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: omacom/omarchy-pkgs
+          ref: master
+          path: .build-sources/omarchy-pkgs
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Build ZFS ISO
+        run: >-
+          ./bin/omarchy-iso-make --no-boot-offer --debug
+          --local-source "$GITHUB_WORKSPACE/.build-sources/omarchy"
+          "$GITHUB_WORKSPACE/.build-sources/omarchy-pkgs"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: omarchy-zfs-iso-${{ github.run_number }}
+          path: release/*.iso
+          retention-days: 2
+          if-no-files-found: error
+
   # Which channels this run makes, under which version, and where each goes:
   # test/vm-image/nightly-plan decides, from what is fetched here.
   plan:
     name: Plan
+    if: github.ref_name != 'quattro-on-zfs'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:

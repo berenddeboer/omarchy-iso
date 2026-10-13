@@ -1113,6 +1113,13 @@ done
 # Live ISO uses the same offline pacman.conf.
 cp "$build_cache_dir/pacman-offline.conf" "$build_cache_dir/airootfs/etc/pacman.conf"
 
+# Keep mkarchiso away from the shared host cache: local builds and republished
+# packages can reuse a filename with different contents. The offline mirror is
+# authoritative for this build, so fetch into a fresh container-local cache.
+# Apply this only after copying the config into the ISO; /tmp here is build-only.
+mkdir -p /tmp/omarchy-live-pkg-cache
+sed -i '/^\[options\]$/a CacheDir = /tmp/omarchy-live-pkg-cache' "$build_cache_dir/pacman-offline.conf"
+
 # Build the ISO. profiledef.sh reads OMARCHY_ARCH for the archiso arch/bootmodes.
 echo "[timing] mkarchiso start $(date +%s)"
 "$mkarchiso_command" -v -w "$build_cache_dir/work/" -o /out/ "$build_cache_dir/"
