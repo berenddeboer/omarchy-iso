@@ -147,8 +147,8 @@ sed -i -E '/^(linux|broadcom-wl)$/d' "$build_cache_dir/packages.x86_64"
 
 # Build the offline mirror: everything pacstrap might want during the target
 # install. With --local-source, the omarchy* packages we just built are
-# already in the mirror and we filter them out below. Without it, pacman -Syw
-# pulls the published omarchy* from the network mirror like any other package.
+# already in the mirror and a local repository supplies them. Without it,
+# pacman -Syw pulls the published omarchy* like any other package.
 if [[ -d /omarchy-source ]]; then
   base_pkg_lists=(/omarchy-source/install/omarchy-base.packages /omarchy-source/install/omarchy-other.packages)
   setup_form=/omarchy-source/install/provisioning/setup-form.sh
@@ -211,22 +211,21 @@ mapfile -t all_packages < <(
   } | sort -u
 )
 
-# With --local-source we already built these omarchy* packages directly into
-# the mirror; strip them from the pacman -Syw list so it doesn't try to fetch
-# the published versions on top.
+online_config="/configs/pacman-online-${OMARCHY_MIRROR}.conf"
+# Resolve against the actual local artifacts as well as the online repositories.
+# Filtering local targets out loses dependencies added by their package recipes
+# (which need not appear in the runtime's package lists).
 if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
-  mapfile -t all_packages < <(
-    printf '%s\n' "${all_packages[@]}" |
-      grep -Fxv \
-        -e "$OMARCHY_RUNTIME_PACKAGE" \
-        -e "$OMARCHY_SETTINGS_PACKAGE" \
-        -e "$OMARCHY_NVIM_PACKAGE" || true
-  )
+  local_repo_dir=$(mktemp -d /tmp/omarchy-local-repo.XXXXXX)
+  bash /builder/prepare-local-repo.sh "$offline_mirror_dir" "$local_repo_dir" \
+    "$online_config" "$local_repo_dir/pacman.conf" \
+    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
+  online_config="$local_repo_dir/pacman.conf"
 fi
 
 mkdir -p /tmp/offlinedb
 download_offline_packages() {
-  pacman --config /configs/pacman-online-${OMARCHY_MIRROR}.conf --noconfirm -Syw \
+  pacman --config "$online_config" --noconfirm -Syw \
     "${all_packages[@]}" --cachedir "$offline_mirror_dir/" --dbpath /tmp/offlinedb --needed
 }
 
@@ -244,38 +243,14 @@ fi
 # newest version of every cached package name) removes packages that have left
 # the lists or dependency closure, such as an old Electron major version.
 if ! resolved_package_files="$(
-  pacman --config "/configs/pacman-online-${OMARCHY_MIRROR}.conf" --noconfirm \
+  pacman --config "$online_config" --noconfirm \
     --dbpath /tmp/offlinedb -S --print --print-format '%f' "${all_packages[@]}"
 )"; then
+  printf '%s\n' "$resolved_package_files" >&2
   echo "ERROR: could not resolve the package files required by the offline mirror" >&2
   exit 1
 fi
 mapfile -t required_package_files <<< "$resolved_package_files"
-
-# The online transaction intentionally excludes packages built from the local
-# checkouts. Add those exact artifacts back to the keep-set after verifying
-# that the local build left exactly one file for each selected package name.
-if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
-  for local_package_name in \
-    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
-    local_package_file=""
-    for candidate in "$offline_mirror_dir/$local_package_name-"*.pkg.tar.*; do
-      [[ -f $candidate && $candidate != *.sig ]] || continue
-      read -r candidate_name _ < <(pacman -Qp "$candidate" 2>/dev/null) || continue
-      [[ $candidate_name == "$local_package_name" ]] || continue
-      if [[ -n $local_package_file ]]; then
-        echo "ERROR: multiple local builds found for $local_package_name" >&2
-        exit 1
-      fi
-      local_package_file="${candidate##*/}"
-    done
-    if [[ -z $local_package_file ]]; then
-      echo "ERROR: local build not found for $local_package_name" >&2
-      exit 1
-    fi
-    required_package_files+=("$local_package_file")
-  done
-fi
 
 printf '%s\n' "${required_package_files[@]}" |
   bash /builder/prune-offline-mirror.sh "$offline_mirror_dir"
@@ -327,15 +302,20 @@ resolve_expected_packages() {
   # Capture before counting: no pipefail here, so a pacman failure inside a
   # pipeline would become a plausible partial count, which never trips the
   # dashboard's fallback.
-  resolved="$(pacman --config "$build_cache_dir/pacman-offline.conf" \
+  if ! resolved="$(pacman --config "$build_cache_dir/pacman-offline.conf" \
     --root "$resolve_root" --dbpath "$resolve_root/var/lib/pacman" \
-    --noconfirm -S --print --print-format '%n' "${targets[@]}")" || return 1
+    --noconfirm -S --print --print-format '%n' "${targets[@]}")"; then
+    # Pacman writes dependency details to stdout, which the nested command
+    # substitutions otherwise swallow on failure.
+    printf '%s\n' "$resolved" >&2
+    return 1
+  fi
 
   printf '%s\n' "$resolved" | sort -u | grep -c .
 }
 
-# Worth failing the build over: -S --print only aborts when a target is missing
-# from the offline repo, which would fail pacstrap the same way. A count that
+# Worth failing the build over: missing targets or unsatisfied dependencies
+# in the offline repo would fail pacstrap the same way. A count that
 # merely looks wrong is not — the dashboard falls back without the file.
 if ! expected_packages="$(resolve_expected_packages)"; then
   echo "ERROR: could not resolve the target package count from the offline mirror." >&2
