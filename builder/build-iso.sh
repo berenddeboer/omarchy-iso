@@ -390,8 +390,8 @@ sed -i -E '/^(linux|broadcom-wl)$/d' "$live_packages_file"
 
 # Build the offline mirror: everything pacstrap might want during the target
 # install. With --local-source, the omarchy* packages we just built are
-# already in the mirror and we filter them out below. Without it, pacman -Syw
-# pulls the published omarchy* from the network mirror like any other package.
+# already in the mirror and a local repository supplies them. Without it,
+# pacman -Syw pulls the published omarchy* like any other package.
 if [[ -d /omarchy-source ]]; then
   base_pkg_lists=(/omarchy-source/install/omarchy-base.packages /omarchy-source/install/omarchy-other.packages)
   setup_form=/omarchy-source/install/provisioning/setup-form.sh
@@ -670,50 +670,13 @@ if [[ $OMARCHY_ARCH == aarch64 ]]; then
   mapfile -t target_packages < <(printf '%s\n' "${target_packages[@]}" | sort -u)
 fi
 
-# Leaving the local builds out of the download also leaves out what they
-# depend on, so a dependency no package list names (omarchy-dev's
-# omarchy-themes-intros) would be missing from the mirror. Name each one,
-# except what the local builds provide themselves (omarchy-settings-dev's
-# omarchy-security-functions): asked for by name, pacman would fetch the
-# published provider on top of the local build.
+# Resolve local artifacts and their dependencies before the online repositories.
 if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
-  local_pkginfo=$(
-    for pkg in "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
-      for archive in "$offline_mirror_dir/$pkg"-[0-9]*.pkg.tar.*; do
-        [[ $archive == *.sig ]] || bsdtar -xOf "$archive" .PKGINFO
-      done
-    done
-  )
-  mapfile -t local_provides < <(sed -n 's/^\(pkgname\|provides\) = //p' <<<"$local_pkginfo" | sed 's/[<>=].*//')
-  mapfile -t local_depends < <(
-    sed -n 's/^depend = //p' <<<"$local_pkginfo" | sed 's/[<>=].*//' |
-      grep -Fxv -f <(printf '%s\n' "${local_provides[@]}") || true
-  )
-  mapfile -t all_packages < <(printf '%s\n' "${all_packages[@]}" "${local_depends[@]}" | sort -u)
-  # The install asks for what the local builds depend on, from the shipped mirror.
-  mapfile -t target_packages < <(printf '%s\n' "${target_packages[@]}" "${local_depends[@]}" | sort -u)
-fi
-
-# With --local-source we already built these omarchy* packages directly into
-# the mirror; strip them from the pacman -Syw list so it doesn't try to fetch
-# the published versions on top.
-if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
-  mapfile -t all_packages < <(
-    printf '%s\n' "${all_packages[@]}" |
-      grep -Fxv \
-        -e "$OMARCHY_RUNTIME_PACKAGE" \
-        -e "$OMARCHY_SETTINGS_PACKAGE" \
-        -e "$OMARCHY_NVIM_PACKAGE" || true
-  )
-  # They are in the image, so never shipped; and the online db the closure is
-  # resolved against does not know the local builds.
-  mapfile -t target_packages < <(
-    printf '%s\n' "${target_packages[@]}" |
-      grep -Fxv \
-        -e "$OMARCHY_RUNTIME_PACKAGE" \
-        -e "$OMARCHY_SETTINGS_PACKAGE" \
-        -e "$OMARCHY_NVIM_PACKAGE" || true
-  )
+  local_repo_dir=$(mktemp -d /tmp/omarchy-local-repo.XXXXXX)
+  bash /builder/prepare-local-repo.sh "$offline_mirror_dir" "$local_repo_dir" \
+    "$online_pacman_conf" "$local_repo_dir/pacman.conf" \
+    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
+  online_pacman_conf="$local_repo_dir/pacman.conf"
 fi
 
 mkdir -p /tmp/offlinedb
@@ -813,38 +776,11 @@ if ! resolved_package_files="$(
   pacman --config "$online_pacman_conf" --noconfirm \
     --dbpath /tmp/offlinedb -S --print --print-format '%f' "${all_packages[@]}"
 )"; then
+  printf '%s\n' "$resolved_package_files" >&2
   echo "ERROR: could not resolve the package files required by the offline mirror" >&2
   exit 1
 fi
 mapfile -t required_package_files <<< "$resolved_package_files"
-
-# The online transaction intentionally excludes packages built from the local
-# checkouts. Add those exact artifacts back to the keep-set after verifying
-# that the local build left exactly one file for each selected package name.
-# The settings package is a live ISO package; the runtime and nvim packages
-# are only in the image now, but keeping all three in the mirror leaves
-# omarchy-apply-system able to resolve them like any published build.
-if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
-  for local_package_name in \
-    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
-    local_package_file=""
-    for candidate in "$offline_mirror_dir/$local_package_name-"*.pkg.tar.*; do
-      [[ -f $candidate && $candidate != *.sig ]] || continue
-      read -r candidate_name _ < <(pacman -Qp "$candidate" 2>/dev/null) || continue
-      [[ $candidate_name == "$local_package_name" ]] || continue
-      if [[ -n $local_package_file ]]; then
-        echo "ERROR: multiple local builds found for $local_package_name" >&2
-        exit 1
-      fi
-      local_package_file="${candidate##*/}"
-    done
-    if [[ -z $local_package_file ]]; then
-      echo "ERROR: local build not found for $local_package_name" >&2
-      exit 1
-    fi
-    required_package_files+=("$local_package_file")
-  done
-fi
 
 printf '%s\n' "${required_package_files[@]}" |
   bash /builder/prune-offline-mirror.sh "$offline_mirror_dir"
