@@ -809,7 +809,10 @@ rebuild_offline_repo_db
 # both, and every install early-loads its own on first boot.
 # omarchy-apply-system still installs more from omarchy-other.packages as the
 # hardware dictates.
-per_machine_packages=(alsa-firmware sof-firmware tailscale)
+# ZFS is installed from the complete offline mirror, not this Btrfs image.
+# T2 headers belong with the T2 kernel selected on that hardware; installing
+# them alone creates a modules directory without the kernel's pkgbase.
+per_machine_packages=(alsa-firmware sof-firmware tailscale linux-t2-headers dkms zfs-dkms zfs-utils)
 
 # On aarch64 the image also holds what the x86_64 runtime pulls in by
 # dependency and the aarch64 one does not: the Limine/Snapper stack, which UEFI
