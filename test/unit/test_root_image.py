@@ -25,6 +25,8 @@ sys.modules.setdefault(
     "orchestrator.archinstall_adapter", types.ModuleType("orchestrator.archinstall_adapter")
 )
 
+from context_fixture import ContextFixture
+
 from orchestrator import phases_impl  # noqa: E402
 
 
@@ -114,7 +116,7 @@ class VerifyRootImageTest(unittest.TestCase):
     HELPER = phases_impl.ROOT_IMAGE_VERIFY_HELPER
 
     def setUp(self):
-        self.ctx = types.SimpleNamespace(state_dir=Path("/nonexistent"))
+        self.ctx = ContextFixture(state_dir=Path("/nonexistent"))
         self.infos = []
         patch = mock.patch.object(phases_impl, "info", side_effect=self.infos.append)
         patch.start()
@@ -292,8 +294,22 @@ class PrepareInstallTargetTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def test_zfs_verifies_medium_before_creating_the_pool(self):
+        from orchestrator import zfs_storage
+
+        ctx = ContextFixture(storage={"filesystem": "zfs"})
+        with mock.patch.object(zfs_storage, "prepare", side_effect=lambda ctx: self.calls.append("zfs_prepare")):
+            phases_impl.prepare_install_target(ctx)
+        self.assertEqual(self.calls, ["verify_install_medium", "zfs_prepare"])
+
+        with mock.patch.object(phases_impl, "verify_install_medium", side_effect=RuntimeError("corrupt medium")), \
+                mock.patch.object(zfs_storage, "prepare") as prepare:
+            with self.assertRaisesRegex(RuntimeError, "corrupt medium"):
+                phases_impl.prepare_install_target(ctx)
+            prepare.assert_not_called()
+
     def test_full_disk_checks_json_layout_then_image(self):
-        ctx = types.SimpleNamespace(
+        ctx = ContextFixture(
             is_protected=False, target=Path("/mnt"),
             user_configuration={"disk_config": btrfs_root_layout()},
         )
@@ -301,7 +317,7 @@ class PrepareInstallTargetTest(unittest.TestCase):
         self.assertEqual(self.calls, ["verify_root_image_layout", "verify_install_medium"])
 
     def test_protected_checks_real_mounts_then_image(self):
-        ctx = types.SimpleNamespace(
+        ctx = ContextFixture(
             is_protected=True, target=Path("/mnt"),
             user_configuration={"disk_config": {"config_type": "pre_mounted_config"}},
         )
@@ -323,7 +339,7 @@ class VerifyPreMountedRootEmptyTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.ctx = types.SimpleNamespace(
+        self.ctx = ContextFixture(
             is_protected=True, target=Path("/mnt"), state_dir=Path(tmp.name) / "state",
             user_configuration={"disk_config": {"config_type": "pre_mounted_config"}},
         )
@@ -413,7 +429,7 @@ class FinishRootImageTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.ctx = types.SimpleNamespace(target=Path(self.tmp.name) / "mnt")
+        self.ctx = ContextFixture(target=Path(self.tmp.name) / "mnt")
         self.packages = {"limine", "omarchy-keyring", "omarchy"}
         self.calls = []
         for patch in (
@@ -457,7 +473,7 @@ class TargetKeyringUnitTest(unittest.TestCase):
 
     def setUp(self):
         self.target = Path("/mnt")
-        self.ctx = types.SimpleNamespace(target=self.target, state={})
+        self.ctx = ContextFixture(target=self.target, state={})
         self.runs = []
         self.popens = []
 

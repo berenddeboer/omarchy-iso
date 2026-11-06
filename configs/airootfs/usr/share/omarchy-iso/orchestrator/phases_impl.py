@@ -642,8 +642,9 @@ def arch_install_system(ctx: InstallContext) -> None:
         with _time_step("STEP.sanity_check"):
             arch.sanity_check(installer)
 
-        with _time_step("STEP.install_root_image"):
-            _install_root_image(ctx)
+        if not ctx.is_zfs:
+            with _time_step("STEP.install_root_image"):
+                _install_root_image(ctx)
 
         if not pre_mounted and arch.is_encrypted(config):
             installer.generate_key_files()
@@ -677,6 +678,16 @@ def arch_install_system(ctx: InstallContext) -> None:
             if missing_headers:
                 with _time_step(f"STEP.kernel_headers ({' '.join(missing_headers)})"):
                     installer.add_additional_packages(missing_headers)
+
+            if ctx.is_zfs:
+                # The Btrfs image cannot be written onto a ZFS dataset. The
+                # base delta above bootstraps an empty target too; install the
+                # full runtime before creating users so /etc/skel is present.
+                installer.add_additional_packages(_runtime_package_list(ctx))
+                subprocess.run(
+                    ["systemd-machine-id-setup", f"--root={ctx.target}"],
+                    check=True, capture_output=True,
+                )
 
             # The image holds the plain default set. A board with a default set
             # of its own (the N1x, the Snapdragon laptops) gets what that set
@@ -1789,20 +1800,6 @@ def _drop_archinstall_zram_conf(ctx: InstallContext) -> None:
     zram_conf.unlink(missing_ok=True)
 
 
-def _install_early_packages(installer) -> None:
-    bootstrap_packages = _early_bootstrap_packages()
-    user_seed_packages = _early_user_seed_packages()
-
-    info(f"› installing early Omarchy packages: {', '.join(bootstrap_packages)}")
-    installer.add_additional_packages(bootstrap_packages)
-
-    info(f"› installing LuaRocks prerequisites: {', '.join(EARLY_LUAROCKS_PACKAGES)}")
-    installer.add_additional_packages(EARLY_LUAROCKS_PACKAGES)
-
-    info(f"› installing user seed packages: {', '.join(user_seed_packages)}")
-    installer.add_additional_packages(user_seed_packages)
-
-
 def _seed_zfs_user_home(ctx: InstallContext) -> None:
     """Archinstall skips /etc/skel when the mounted ZFS home already exists."""
     from . import zfs_storage
@@ -1918,23 +1915,17 @@ def _write_language_marker(ctx: InstallContext) -> None:
 
 
 def _runtime_package_list(ctx: InstallContext) -> list[str]:
-    """Selected Omarchy runtime package + every package in the ISO-bundled
-    base package list that isn't already installed early."""
+    """The complete runtime for a ZFS target without a copied root image."""
     base_pkgs_file = Path("/usr/share/omarchy-iso/omarchy-base.packages")
-    pkgs = [_omarchy_runtime_package()]
-    already_installed = set(_early_packages()) | {
-        _omarchy_runtime_package(),
-        _omarchy_settings_package(),
-        _omarchy_nvim_package(),
-        "omarchy",
-        "omarchy-settings",
-        "omarchy-nvim",
-    }
+    pkgs = [
+        "base-devel", "git", "limine", "efibootmgr", "omarchy-keyring", "lua51", "luarocks",
+        _omarchy_runtime_package(), _omarchy_settings_package(), _omarchy_nvim_package(),
+    ]
     for raw in base_pkgs_file.read_text().splitlines():
         s = raw.strip()
         if not s or s.startswith("#"):
             continue
-        if s not in already_installed and s not in pkgs:
+        if s not in pkgs:
             pkgs.append(s)
     if ctx.is_zfs:
         kernel = ctx.storage.get("kernel") or (ctx.user_configuration.get("kernels") or ["linux"])[0]
@@ -2495,6 +2486,7 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
 
 def run_system_finalizer(ctx: InstallContext) -> None:
     if ctx.is_zfs:
+        _join_target_keyring_init(ctx)
         key = Path("/usr/share/omarchy-iso/archzfs.gpg")
         if not key.exists():
             raise RuntimeError("ArchZFS signing key is missing from the ISO")
@@ -2884,7 +2876,7 @@ def finalize_limine_boot(ctx: InstallContext) -> None:
     if prebuilt_uki.is_file() and provisioning_key:
         info("› the first boot unlocks with the provisioning key; "
              "building the UKI on this machine so its initramfs carries it")
-    skip_prebuilt = bool(added_modules) or bool(stale_keymap) or provisioning_key
+    skip_prebuilt = ctx.is_zfs or bool(added_modules) or bool(stale_keymap) or provisioning_key
 
     # A selected kernel other than the image's boots first, as in omarchy's own
     # kernel migration. Written before any UKI is built so the entries sort by it.
@@ -3373,7 +3365,7 @@ def validate_boot(ctx: InstallContext) -> None:
 
     # cryptdevice= has to reach the next limine-mkinitcpio rebuild: through
     # the entry in limine.conf, or through /etc/kernel/cmdline.
-    if ctx.encrypt and "cryptdevice=" not in limine_conf_text and "cryptdevice=" not in kernel_cmdline.read_text():
+    if ctx.has_luks_root and "cryptdevice=" not in limine_conf_text and "cryptdevice=" not in kernel_cmdline.read_text():
         raise RuntimeError(f"Encrypted install but neither {limine_conf} nor {kernel_cmdline} has cryptdevice=")
 
     default_limine = ctx.target / "etc" / "default" / "limine"
@@ -3387,7 +3379,7 @@ def validate_boot(ctx: InstallContext) -> None:
             raise RuntimeError(f"{limine_binary} missing or empty")
 
         if _limine_setting(config_text, "ENABLE_UKI", "yes") == "no":
-            _validate_linux_boot_entry(esp_mount, limine_conf_text, ctx.encrypt)
+            _validate_linux_boot_entry(esp_mount, limine_conf_text, ctx.has_luks_root)
         else:
             # Hardware packages (omarchy-hw-intel-ptl, …) can swap the configured
             # kernel out mid-install, so trust what's on disk over what we asked

@@ -19,6 +19,7 @@ sys.modules.setdefault(
     types.ModuleType("orchestrator.archinstall_adapter"),
 )
 from orchestrator import context, phases_impl  # noqa: E402
+from context_fixture import ContextFixture
 
 
 class KernelSelectionTest(unittest.TestCase):
@@ -94,10 +95,11 @@ class KernelSelectionTest(unittest.TestCase):
         # kernel's, so only a kernel the image lacks (linux-t2) costs a pacman
         # run, straight after the base delta; and a failure there must still
         # restore the pacman hooks and release the package cache.
-        in_image = {"linux-omarchy-headers"}
-        for kernels in (["linux-omarchy"], ["linux-t2"], ["linux-omarchy", "linux-lts"]):
+        cases = (["linux-omarchy"], ["linux-t2"], ["linux-omarchy", "linux-lts"])
+        for kernels, filesystem in ((k, fs) for k in cases for fs in ("btrfs", "zfs")):
+            in_image = {"linux-omarchy-headers"} if filesystem == "btrfs" else set()
             for fail_headers in (False, True):
-                with self.subTest(kernels=kernels, fail_headers=fail_headers), ExitStack() as stack:
+                with self.subTest(kernels=kernels, filesystem=filesystem, fail_headers=fail_headers), ExitStack() as stack:
                     events = []
                     installer = mock.MagicMock()
 
@@ -112,18 +114,23 @@ class KernelSelectionTest(unittest.TestCase):
                         swap=None, auth_config=None, app_config=None, timezone=None,
                         ntp=False, hostname="test", pacman_config="/etc/pacman.conf",
                     )
-                    ctx = types.SimpleNamespace(
+                    ctx = ContextFixture(
                         state={"arch_config_handler": types.SimpleNamespace(config=config), "mirror_handler": None},
                         target=Path("/unused"), tailscale_authkey_path=None, defer_provisioning=False,
                         omarchy_install={},
+                        storage={"filesystem": filesystem},
                     )
                     # _start_target_keyring_init starts a real systemd-run unit
                     # on whatever machine runs the tests, left running
                     # unjoined (ResourceWarning: subprocess is still running).
                     for name in ("_mount_offline_package_cache", "_mask_mkinitcpio_pacman_hooks",
-                                 "_configure_limine_boot", "_write_pre_mounted_fstab", "_install_root_image",
+                                 "_configure_limine_boot", "_write_pre_mounted_fstab",
                                  "_start_target_keyring_init"):
                         stack.enter_context(mock.patch.object(phases_impl, name))
+                    image = stack.enter_context(mock.patch.object(phases_impl, "_install_root_image"))
+                    runtime = ["omarchy", "omarchy-settings", "omarchy-nvim", "zfs-dkms"]
+                    stack.enter_context(mock.patch.object(phases_impl, "_runtime_package_list", return_value=runtime))
+                    stack.enter_context(mock.patch.object(phases_impl.subprocess, "run"))
                     unmask = stack.enter_context(mock.patch.object(phases_impl, "_unmask_mkinitcpio_pacman_hooks"))
                     unmount = stack.enter_context(mock.patch.object(phases_impl, "_unmount_offline_package_cache"))
                     stack.enter_context(mock.patch.object(phases_impl, "configure_keyboard", return_value=True))
@@ -149,7 +156,11 @@ class KernelSelectionTest(unittest.TestCase):
                             phases_impl.arch_install_system(ctx)
                     else:
                         phases_impl.arch_install_system(ctx)
-                    self.assertEqual(events, ["base"] + ([missing] if missing else []))
+                    expected = ["base"] + ([missing] if missing else [])
+                    if filesystem == "zfs" and not fail_headers:
+                        expected.append(runtime)
+                    self.assertEqual(events, expected)
+                    self.assertEqual(image.call_count, int(filesystem == "btrfs"))
                     unmask.assert_called_once_with(ctx)
                     unmount.assert_called_once_with(ctx)
 
@@ -157,7 +168,7 @@ class KernelSelectionTest(unittest.TestCase):
         for kernel in ("linux-omarchy", "linux-t2"):
             with self.subTest(kernel=kernel), tempfile.TemporaryDirectory() as tmp:
                 target = Path(tmp)
-                ctx = types.SimpleNamespace(target=target)
+                ctx = ContextFixture(target=target)
                 with self.assertRaisesRegex(RuntimeError, "no installed kernel"):
                     phases_impl._validate_kernel_headers(ctx)
                 modules = target / "usr/lib/modules/7.2-test"
@@ -177,7 +188,7 @@ class KernelSelectionTest(unittest.TestCase):
         # Arch Linux ARM's linux-aarch64 records no pkgbase next to its modules.
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
-            ctx = types.SimpleNamespace(target=target)
+            ctx = ContextFixture(target=target)
             modules = target / "usr/lib/modules/7.2.9-1-aarch64-ARCH"
             modules.mkdir(parents=True)
             (modules / "modules.builtin").write_text("kernel/fs/ext4/ext4.ko\n")
@@ -225,7 +236,7 @@ class KernelSelectionTest(unittest.TestCase):
                     path = target / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(content)
-                ctx = types.SimpleNamespace(
+                ctx = ContextFixture(
                     target=target, omarchy_install={"storage": storage},
                     user_configuration=configuration, encrypt=False,
                     is_protected=False, defer_provisioning=False,
@@ -262,7 +273,7 @@ class KernelSelectionTest(unittest.TestCase):
                 path = target / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content)
-            ctx = types.SimpleNamespace(
+            ctx = ContextFixture(
                 target=target, omarchy_install={"storage": {"kernel": "linux-t2"}},
                 user_configuration={}, encrypt=False,
                 is_protected=False, defer_provisioning=False,

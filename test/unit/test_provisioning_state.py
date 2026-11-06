@@ -22,6 +22,8 @@ sys.modules.setdefault(
     "orchestrator.archinstall_adapter", types.ModuleType("orchestrator.archinstall_adapter")
 )
 
+from context_fixture import ContextFixture
+
 from orchestrator import phases_impl  # noqa: E402
 from orchestrator.context import InstallContext  # noqa: E402
 
@@ -171,7 +173,7 @@ def make_ctx(target, **overrides):
         state={},
     )
     defaults.update(overrides)
-    return types.SimpleNamespace(**defaults)
+    return ContextFixture(**defaults)
 
 
 class StageProvisioningStateTest(unittest.TestCase):

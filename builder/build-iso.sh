@@ -330,7 +330,9 @@ if [[ -d /omarchy-source && -d /omarchy-pkgs ]]; then
     echo "ERROR: local Omarchy source does not provide Quattro-on-ZFS setup" >&2
     exit 1
   fi
-  touch "$build_cache_dir/airootfs/usr/share/omarchy-iso/zfs-capable"
+  if [[ $OMARCHY_ARCH == x86_64 ]]; then
+    touch "$build_cache_dir/airootfs/usr/share/omarchy-iso/zfs-capable"
+  fi
   pacman-key --export "$ARCHZFS_KEY" >"$build_cache_dir/airootfs/usr/share/omarchy-iso/archzfs.gpg"
   bash /builder/build-omarchy-packages.sh "$offline_mirror_dir"
   LOCAL_OMARCHY_BUILD=1
@@ -371,7 +373,7 @@ if [[ $OMARCHY_ARCH == aarch64 ]]; then
   arch_packages=("$OMARCHY_KERNEL" archlinuxarm-keyring git gum jq openssl openssh pciutils plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted systemd-ukify linux-firmware-qcom qcom-firmware-extract python)
 else
   # linux-t2 is the live kernel on a Mac (configs/grub/grub.cfg).
-  arch_packages=("$OMARCHY_KERNEL" linux-t2 linux-t2-headers gptfdisk dkms zfs-utils zfs-dkms git gum jq openssl plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
+  arch_packages=("$OMARCHY_KERNEL" "$OMARCHY_KERNEL-headers" linux-t2 linux-t2-headers gptfdisk dkms zfs-utils zfs-dkms git gum jq openssl plymouth ttfx terminus-font tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
 fi
 live_packages_file="$build_cache_dir/packages.$OMARCHY_ARCH"
 printf '%s\n' "${arch_packages[@]}" >> "$live_packages_file"
@@ -924,6 +926,11 @@ if ! installable_files="$(
   exit 1
 fi
 shipped_list="$build_cache_dir/airootfs/usr/share/omarchy-iso/offline-mirror.shipped"
+if [[ -f $build_cache_dir/airootfs/usr/share/omarchy-iso/zfs-capable ]]; then
+  # ZFS bootstraps from packages rather than copying the Btrfs image.
+  # Keep the entire target closure, including the locally built runtime.
+  printf '%s\n' "$installable_files" | sort -u >"$shipped_list"
+else
 # archlinuxarm-keyring stays too, with its signature: on aarch64 validate_boot
 # checks the target keyring against them (_validate_package_signing).
 awk -F'\t' '
@@ -931,10 +938,11 @@ awk -F'\t' '
   FILENAME == ARGV[2] { image[$1 "\t" $2] = 1; next }
   (!(($1 "\t" $2) in image) && ($3 in installable)) || $1 == "archlinuxarm-keyring" { print $3 }
 ' <(printf '%s\n' "$installable_files") <(image_package_index) <(mirror_package_index) | sort -u >"$shipped_list"
+fi
 # grep -c exits 1 on no match; the count check below wants the 0.
 shipped_count=$(grep -c . "$shipped_list" || true)
 mirror_count=$(mirror_package_index | wc -l)
-if (( shipped_count == 0 || shipped_count >= mirror_count )); then
+if (( shipped_count == 0 || shipped_count > mirror_count )); then
   echo "ERROR: the shipped-mirror selection looks wrong: $shipped_count of $mirror_count packages" >&2
   exit 1
 fi

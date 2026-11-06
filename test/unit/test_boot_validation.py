@@ -9,6 +9,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "configs/airootfs/usr/share/omarchy-iso"))
 sys.modules.setdefault("orchestrator.archinstall_adapter", types.ModuleType("orchestrator.archinstall_adapter"))
+from context_fixture import ContextFixture
+
 from orchestrator import phases_impl as phases  # noqa: E402
 
 
@@ -38,7 +40,7 @@ class BootValidationTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.ctx = types.SimpleNamespace(
+        self.ctx = ContextFixture(
             target=self.root, omarchy_install={"storage": {"kernel": "linux-aarch64"}},
             user_configuration={}, encrypt=False, is_protected=False, defer_provisioning=False,
         )

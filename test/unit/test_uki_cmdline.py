@@ -24,6 +24,8 @@ sys.modules.setdefault(
     "orchestrator.archinstall_adapter",
     types.ModuleType("orchestrator.archinstall_adapter"),
 )
+from context_fixture import ContextFixture
+
 from orchestrator import phases_impl  # noqa: E402
 from orchestrator.uki_cmdline import PLACEHOLDER, embed_cmdline  # noqa: E402
 
@@ -132,7 +134,7 @@ class EmbedBeforeTheHashTest(unittest.TestCase):
                 hashed.append(esp_uki.read_bytes())
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        ctx = types.SimpleNamespace(target=target, user_configuration={"kernels": ["linux-omarchy"]})
+        ctx = ContextFixture(target=target, user_configuration={"kernels": ["linux-omarchy"]})
         firmware = types.SimpleNamespace(has_uefi=lambda: True)
         with mock.patch.object(phases_impl.subprocess, "run", run), \
              mock.patch.object(phases_impl, "arch", firmware), \
@@ -168,7 +170,7 @@ class PrebuiltUkiNameTest(unittest.TestCase):
                 registered.append(cmd[cmd.index("--add-uki") + 2])
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        ctx = types.SimpleNamespace(target=target, user_configuration={"kernels": ["linux-omarchy"]})
+        ctx = ContextFixture(target=target, user_configuration={"kernels": ["linux-omarchy"]})
         firmware = types.SimpleNamespace(has_uefi=lambda: True)
         with mock.patch.object(phases_impl.subprocess, "run", run), \
              mock.patch.object(phases_impl, "arch", firmware), \

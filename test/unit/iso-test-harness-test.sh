@@ -10,6 +10,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 harness="$ROOT/bin/omarchy-iso-test"
+FILESYSTEM=btrfs
 bash -n "$harness"
 
 work=$(mktemp -d)
@@ -133,7 +134,7 @@ naming=$(sed -n '/^BASE_NAME="/,/^BASE_DIR=/p' "$harness")
 [[ -n $naming ]] || fail "the harness no longer names its base image with BASE_NAME"
 base_name() { # [VAR=value | VAR+=(value)]...
   ISO="$work/omarchy.iso" KEYBOARD_LABEL="English (US)" REPO_DIR="$work"
-  ENCRYPT=false PROVISION=false FREE_SPACE=false
+  ENCRYPT=false PROVISION=false FREE_SPACE=false FILESYSTEM=btrfs
   FAKE_PCI=() SMBIOS=() CPU_ID="" BATTERY=false ACPI_HIDS=() NO_NETWORK=false
   local setting
   for setting; do eval "$setting"; done

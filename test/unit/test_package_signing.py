@@ -58,6 +58,7 @@ class KeyringBeforeSystemFinalizerTest(unittest.TestCase):
     # unit must have finished when omarchy-apply-system starts.
     def pending_at_finalizer(self, machine):
         ctx = mock.Mock()
+        ctx.is_zfs = False
         ctx.defer_provisioning = False
         ctx.username = "omarchy"
         ctx.target = Path("/mnt")
