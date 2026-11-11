@@ -1,5 +1,44 @@
 # Omarchy ISO
 
+## ZFS support
+
+This fork's `quattro-on-zfs` branch supports installing Omarchy on **ZFS**, alongside the existing Btrfs option. On x86_64 UEFI machines, choose **ZFS (encrypted home, experimental)** in the installer's root-filesystem selection. ZFS installation uses the whole selected disk.
+
+- Root filesystem: `zroot/ROOT/default`.
+- Native-encrypted home: `zroot/data/home/<user>`, unlocked with the user's login password.
+- Disk-backed ZFS datasets for `/tmp` and `/var/tmp`.
+- Limine boot with ZFS kernel modules and hostid support.
+
+The root filesystem and system logs are unencrypted. ZFS installs require password login and do not configure hibernation or Btrfs/Snapper snapshots.
+
+### Download a ZFS ISO
+
+The latest published build is **2026.08.23** for x86_64 UEFI machines (6.5 GB):
+
+- [Download the Quattro-on-ZFS ISO](https://www.berenddeboer.net/tmp/omarchy-2026.08.23-x86_64-quattro-on-zfs.iso).
+- [Release notes and validation results](https://github.com/berenddeboer/omarchy-iso/releases/tag/zfs-2026.08.23).
+- [All ZFS releases](https://github.com/berenddeboer/omarchy-iso/releases).
+
+This experimental build predates the current branch. Its ZFS installation and boot, plus encrypted and unencrypted Btrfs installer paths, were validated; the release notes list known desktop acceptance failures.
+
+After downloading, verify the checksum before writing the ISO to a USB stick:
+
+```bash
+echo '0f53fc7eaedd09d833ee881b78237498185bec96a4fc2ffbf4803c18e25584b7  omarchy-2026.08.23-x86_64-quattro-on-zfs.iso' | sha256sum -c -
+```
+
+### Build the current branch
+
+Build the ZFS-capable ISO with both this repository and the paired [Omarchy fork](https://github.com/berenddeboer/omarchy/tree/quattro-on-zfs) checked out on `quattro-on-zfs`, plus an `omarchy-pkgs` checkout:
+
+```bash
+./bin/omarchy-iso-make --local-source ../omarchy ../omarchy-pkgs --no-boot-offer
+```
+
+ZFS installs use the bundled offline packages; Btrfs installs use the prebuilt root image. The upstream download links and release information below describe the official Omarchy images, which do not include this fork's ZFS support.
+
+## Upstream Omarchy ISO
+
 [![Nightly ISO Build](https://github.com/omacom/omarchy-iso/actions/workflows/nightly-build.yml/badge.svg?branch=quattro&event=schedule)](https://github.com/omacom/omarchy-iso/actions/workflows/nightly-build.yml?query=branch%3Aquattro+event%3Aschedule)
 
 The Omarchy ISO is the only supported way to install Omarchy. It ships the Omarchy Configurator, writes a pre-built Arch Linux + Omarchy root image (a zstd-compressed btrfs partition image) onto the target with `zstdcat | dd`, gives it a fresh filesystem id and grows it to the partition, installs the per-machine packages (audio firmware, and a kernel the image lacks) from the bundled mirror, runs target system setup in the chroot, creates the user, and runs `omarchy-provision-user` for that user.
